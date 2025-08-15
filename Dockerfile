@@ -12,6 +12,16 @@ ARG TARGETARCH
 # create a new empty shell project
 WORKDIR /argocd-diff-preview
 
+# install kind
+RUN apt-get update && apt-get install -y curl
+RUN curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.29.0/kind-linux-${TARGETARCH} && \
+    chmod +x ./kind
+
+# Install Argo CD
+RUN curl -sSL -o argocd-linux-${TARGETARCH} https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-${TARGETARCH} && \
+    install -m 555 argocd-linux-${TARGETARCH} /usr/local/bin/argocd && \
+    rm argocd-linux-${TARGETARCH}
+
 # Copy go mod and sum files
 COPY go.mod go.sum ./
 
@@ -27,16 +37,6 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -ldflags="-s -w -X 'main.Version=${VERSION}' -X 'main.Commit=${COMMIT}' -X 'main.BuildDate=${BUILD_DATE}'" \
     -trimpath \
     -o argocd-diff-preview ./cmd
-
-# install kind
-RUN apt-get update && apt-get install -y curl
-RUN curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.29.0/kind-linux-${TARGETARCH} && \
-    chmod +x ./kind
-
-# Install Argo CD
-RUN curl -sSL -o argocd-linux-${TARGETARCH} https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-${TARGETARCH} && \
-    install -m 555 argocd-linux-${TARGETARCH} /usr/local/bin/argocd && \
-    rm argocd-linux-${TARGETARCH}
 
 FROM gcr.io/distroless/static-debian12 AS final
 
