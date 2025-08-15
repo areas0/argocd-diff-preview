@@ -193,29 +193,90 @@ func run(opts *Options) error {
 	// Optionally expand Applications-of-Applications
 	enabled, maxDepth := opts.GetAppsOfApps()
 	if enabled {
-		appsOfAppsOpts := argoapplication.AppsOfAppsOptions{
-			Enabled:           true,
-			MaxDepth:          maxDepth,
-			TempFolder:        fmt.Sprintf("%s/apps-of-apps", tempFolder),
-			Debug:             opts.Debug,
-			Repo:              opts.Repo,
-			RedirectRevisions: redirectRevisions,
-			FilterOptions:     filterOptions,
-			ArgoCDNamespace:   opts.ArgocdNamespace,
-			RunPrefix:         uniqueID,
-		}
-
-		baseApps, targetApps, err = argoapplication.ExpandAppsOfAppsInBothBranches(
+		// Phase 1: pre-render only root Applications to detect changed roots
+		preDeleteAfterProcessing := true // always clean up pre-rendered roots
+		preBaseExtracted, preTargetExtracted, _, err := extract.GetResourcesFromBothBranches(
 			argocd,
+			opts.Timeout,
 			baseApps,
 			targetApps,
-			baseBranch,
-			targetBranch,
-			appsOfAppsOpts,
+			uniqueID,
+			preDeleteAfterProcessing,
 		)
 		if err != nil {
-			log.Error().Msgf("❌ Failed to expand Applications of Applications")
+			log.Error().Msg("❌ Failed to pre-render roots for apps-of-apps detection")
 			return err
+		}
+
+		// Observability: how many roots were pre-rendered per branch
+		log.Info().Msgf("🧪 Pre-rendered roots for apps-of-apps detection — base:%d target:%d", len(preBaseExtracted), len(preTargetExtracted))
+
+		// Build maps of rootId -> content and detect changed roots (added/modified/deleted)
+		toContent := func(list []extract.ExtractedApp) map[string]string {
+			m := make(map[string]string, len(list))
+			for _, ea := range list {
+				content, cerr := convertToYamlString(&ea)
+				if cerr != nil {
+					log.Warn().Err(cerr).Str("root", ea.Id).Msg("⚠️ Failed to compute content for root; treating as changed")
+					m[ea.Id] = fmt.Sprintf("error:%v", cerr)
+					continue
+				}
+				m[ea.Id] = content
+			}
+			return m
+		}
+
+		baseMap := toContent(preBaseExtracted)
+		targetMap := toContent(preTargetExtracted)
+		changedRootIDs := make([]string, 0)
+
+		// any id present in either map with differing content is considered changed
+		seen := map[string]struct{}{}
+		for id := range baseMap {
+			seen[id] = struct{}{}
+		}
+		for id := range targetMap {
+			seen[id] = struct{}{}
+		}
+		for id := range seen {
+			b, bok := baseMap[id]
+			t, tok := targetMap[id]
+			if !bok || !tok || b != t {
+				changedRootIDs = append(changedRootIDs, id)
+			}
+		}
+
+		if len(changedRootIDs) == 0 {
+			log.Info().Msg("🧪 No apps-of-apps roots changed after pre-render; skipping expansion")
+		} else {
+			log.Info().Msgf("🤖 Expanding apps-of-apps for %d changed root(s)", len(changedRootIDs))
+			log.Debug().Msgf("Changed roots: %s", strings.Join(changedRootIDs, ", "))
+
+			appsOfAppsOpts := argoapplication.AppsOfAppsOptions{
+				Enabled:           true,
+				MaxDepth:          maxDepth,
+				TempFolder:        fmt.Sprintf("%s/apps-of-apps", tempFolder),
+				Debug:             opts.Debug,
+				Repo:              opts.Repo,
+				RedirectRevisions: redirectRevisions,
+				FilterOptions:     filterOptions,
+				ArgoCDNamespace:   opts.ArgocdNamespace,
+				RunPrefix:         uniqueID,
+				AllowedRootIDs:    changedRootIDs,
+			}
+
+			baseApps, targetApps, err = argoapplication.ExpandAppsOfAppsInBothBranches(
+				argocd,
+				baseApps,
+				targetApps,
+				baseBranch,
+				targetBranch,
+				appsOfAppsOpts,
+			)
+			if err != nil {
+				log.Error().Msgf("❌ Failed to expand Applications of Applications")
+				return err
+			}
 		}
 
 		// Remove duplicates introduced by expansion

@@ -27,6 +27,7 @@ type AppsOfAppsOptions struct {
 	FilterOptions     FilterOptions
 	ArgoCDNamespace   string
 	RunPrefix         string
+	AllowedRootIDs    []string
 }
 
 // ExpandAppsOfAppsInBothBranches expands nested Applications/ApplicationSets discovered via parent Applications for both branches.
@@ -96,6 +97,14 @@ func expandAppsOfApps(
 			parent := queue[i]
 			if parent.Kind != Application { // Only Applications can own child Applications in apps-of-apps
 				continue
+			}
+
+			// If a specific root allowlist is provided, skip non-allowed roots
+			if len(opts.AllowedRootIDs) > 0 {
+				if !stringInSlice(parent.Id, opts.AllowedRootIDs) {
+					log.Debug().Str("branch", branch.Name).Str("parent", parent.GetLongName()).Msg("Skipping parent — not in changed roots allowlist")
+					continue
+				}
 			}
 
 			// Apply a temporary, prefixed copy of the parent to render its child apps
@@ -197,7 +206,11 @@ func expandAppsOfApps(
 	}
 
 	if depth > 0 {
-		log.Info().Str("branch", branch.Name).Msgf("🤖 Apps-of-apps expansion finished at depth %d; total applications: %d", depth, len(result))
+		if len(opts.AllowedRootIDs) > 0 {
+			log.Info().Str("branch", branch.Name).Msgf("🤖 Apps-of-apps expansion finished at depth %d; total applications: %d (gated by %d changed root(s))", depth, len(result), len(opts.AllowedRootIDs))
+		} else {
+			log.Info().Str("branch", branch.Name).Msgf("🤖 Apps-of-apps expansion finished at depth %d; total applications: %d", depth, len(result))
+		}
 	}
 
 	// Final filtering pass if needed (keep behavior consistent with processAppSets)
@@ -383,4 +396,14 @@ func generateAppsFromAppSets(
 		}
 	}
 	return outApps, nil
+}
+
+// stringInSlice returns true if s is present in list
+func stringInSlice(s string, list []string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
