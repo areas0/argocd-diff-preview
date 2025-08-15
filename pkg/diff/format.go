@@ -10,6 +10,19 @@ import (
 	"github.com/sergi/go-diff/diffmatchpatch"
 )
 
+// runPrefixRe matches the temporary run prefix injected into resource names
+// Example: "abc12-b-<name>" or "abc12-t-<name>"
+var runPrefixRe = regexp.MustCompile(`\b[a-f0-9]{5}-(?:b|t)-`)
+
+// normalizeRunPrefixes removes the run prefix tokens from a line so two lines that
+// only differ by the run prefix compare equal.
+func normalizeRunPrefixes(s string) string {
+	if s == "" {
+		return s
+	}
+	return runPrefixRe.ReplaceAllString(s, "")
+}
+
 // shouldIgnoreLine checks if a line should be ignored based on regex pattern
 func shouldIgnoreLine(line, pattern string) bool {
 	matched, err := regexp.MatchString(pattern, line)
@@ -64,6 +77,27 @@ func formatDiff(diffs []diffmatchpatch.Diff, contextLines uint, ignorePattern *s
 				isChange bool
 				show     bool
 			}{prefix, line, isChange, show})
+		}
+	}
+
+	// Post-process: downgrade deletion/insertion pairs that only differ by run prefixes
+	for i := 0; i < len(processedLines)-1; i++ {
+		a := &processedLines[i]
+		b := &processedLines[i+1]
+		if a.isChange && b.isChange && a.show && b.show && a.prefix == "-" && b.prefix == "+" {
+			// Only treat as equal when BOTH lines contain a run prefix token
+			if runPrefixRe.MatchString(a.text) && runPrefixRe.MatchString(b.text) &&
+				normalizeRunPrefixes(a.text) == normalizeRunPrefixes(b.text) {
+				// Treat as no change: convert both to context lines so they don't drive diffs
+				a.isChange = false
+				b.isChange = false
+				a.prefix = " "
+				b.prefix = " "
+				// Optionally normalize the text to keep context neat
+				norm := normalizeRunPrefixes(a.text)
+				a.text = norm
+				b.text = norm
+			}
 		}
 	}
 
