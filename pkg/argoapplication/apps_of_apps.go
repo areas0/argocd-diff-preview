@@ -28,6 +28,10 @@ type AppsOfAppsOptions struct {
 	ArgoCDNamespace   string
 	RunPrefix         string
 	AllowedRootIDs    []string
+	// TimeoutSeconds controls how long to wait for a temporary parent Application
+	// to reach a renderable state before attempting to fetch manifests.
+	// If zero, a sensible default will be used.
+	TimeoutSeconds uint64
 }
 
 // ExpandAppsOfAppsInBothBranches expands nested Applications/ApplicationSets discovered via parent Applications for both branches.
@@ -121,7 +125,11 @@ func expandAppsOfApps(
 			}
 
 			// wait until App is OutOfSync/Synced and manifests are available
-			manifests, err := waitAndGetAppManifests(argo, parentTmpName, parent.GetLongName(), time.Duration(120)*time.Second)
+			waitSeconds := int64(opts.TimeoutSeconds)
+			if waitSeconds <= 0 {
+				waitSeconds = 300 // default to 5 minutes for large charts
+			}
+			manifests, err := waitAndGetAppManifests(argo, parentTmpName, parent.GetLongName(), time.Duration(waitSeconds)*time.Second)
 			if err != nil {
 				log.Error().Err(err).Str("App", parent.GetLongName()).Msg("❌ Failed to get manifests for discovery")
 				// try to delete temp anyway

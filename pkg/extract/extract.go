@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -85,6 +86,10 @@ func GetResourcesFromBothBranches(
 		return nil, nil, time.Since(startTime), err
 	}
 
+	// Announce how many applications will be rendered
+	total := len(baseApps) + len(targetApps)
+	log.Info().Msgf("🤖 Planning to render %d applications — base:%d target:%d", total, len(baseApps), len(targetApps))
+
 	apps := append(baseApps, targetApps...)
 
 	log.Debug().Msg("Applied manifest for both branches")
@@ -132,11 +137,18 @@ func getResourcesFromApps(
 	// Use WaitGroup to wait for all goroutines to complete (including deletions)
 	var wg sync.WaitGroup
 
+	// Track progress across states
+	var startedApps int64  // how many apps have begun processing
+	var renderedApps int64 // how many apps successfully rendered
+	var failedApps int64   // how many apps failed
+
 	for _, app := range apps {
 		sem <- struct{}{} // Acquire semaphore
 		wg.Add(1)         // Add to wait group
 		go func(app argoapplication.ArgoResource) {
 			defer wg.Done() // Signal completion when goroutine ends
+			// Mark this app as started once we have a worker slot
+			atomic.AddInt64(&startedApps, 1)
 			result, k8sName, err := getResourcesFromApp(argocd, app, timeout, prefix)
 			results <- struct {
 				app ExtractedApp
@@ -165,7 +177,6 @@ func getResourcesFromApps(
 
 	// Setup progress tracking
 	totalApps := len(apps)
-	renderedApps := 0
 	progressDone := make(chan bool)
 
 	// Start progress reporting goroutine
@@ -177,7 +188,18 @@ func getResourcesFromApps(
 			select {
 			case <-ticker.C:
 				remainingTimeSeconds := max(0, int(timeout)-int(time.Since(startTime).Seconds()))
-				log.Info().Msgf("🤖 Rendered %d out of %d applications (timeout in %d seconds)", renderedApps, totalApps, remainingTimeSeconds)
+				started := atomic.LoadInt64(&startedApps)
+				rendered := atomic.LoadInt64(&renderedApps)
+				failed := atomic.LoadInt64(&failedApps)
+				inFlight := started - rendered - failed
+				if inFlight < 0 {
+					inFlight = 0
+				}
+				queued := int64(totalApps) - started
+				if queued < 0 {
+					queued = 0
+				}
+				log.Info().Msgf("🤖 Progress: rendered %d/%d • in-flight %d • queued %d • failed %d (timeout in %d seconds)", rendered, totalApps, inFlight, queued, failed, remainingTimeSeconds)
 			case <-progressDone:
 				return
 			}
@@ -191,6 +213,7 @@ func getResourcesFromApps(
 				firstError = result.err
 			}
 			log.Error().Err(result.err).Msg("Failed to extract app:")
+			atomic.AddInt64(&failedApps, 1)
 			continue
 		}
 		switch result.app.Branch {
@@ -201,7 +224,7 @@ func getResourcesFromApps(
 		default:
 			return nil, nil, fmt.Errorf("unknown branch type: '%s'", result.app.Branch)
 		}
-		renderedApps++
+		atomic.AddInt64(&renderedApps, 1)
 	}
 
 	// Signal progress reporting to stop
@@ -217,7 +240,12 @@ func getResourcesFromApps(
 	log.Info().Msg("🧼 All application deletions completed")
 
 	duration := time.Since(startTime)
-	log.Info().Msgf("🤖 Got all resources from %d applications from %s-branch and got %d from %s-branch in %s", len(extractedBaseApps), git.Base, len(extractedTargetApps), git.Target, duration.Round(time.Second))
+	failed := atomic.LoadInt64(&failedApps)
+	if failed > 0 {
+		log.Info().Msgf("🤖 Completed: %d base, %d target • failed %d • duration %s", len(extractedBaseApps), len(extractedTargetApps), failed, duration.Round(time.Second))
+	} else {
+		log.Info().Msgf("🤖 Completed: %d base, %d target • duration %s", len(extractedBaseApps), len(extractedTargetApps), duration.Round(time.Second))
+	}
 
 	return extractedBaseApps, extractedTargetApps, nil
 }

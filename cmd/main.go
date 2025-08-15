@@ -263,6 +263,7 @@ func run(opts *Options) error {
 				ArgoCDNamespace:   opts.ArgocdNamespace,
 				RunPrefix:         uniqueID,
 				AllowedRootIDs:    changedRootIDs,
+				TimeoutSeconds:    opts.Timeout,
 			}
 
 			baseApps, targetApps, err = argoapplication.ExpandAppsOfAppsInBothBranches(
