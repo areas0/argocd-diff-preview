@@ -80,6 +80,8 @@ type Options struct {
 	RedirectTargetRevisions   string `mapstructure:"redirect-target-revisions"`
 	LogFormat                 string `mapstructure:"log-format"`
 	Title                     string `mapstructure:"title"`
+	AppsOfApps                bool   `mapstructure:"apps-of-apps"`
+	AppsOfAppsMaxDepth        int    `mapstructure:"apps-of-apps-max-depth"`
 
 	// We'll store the parsed data in these fields
 	parsedFileRegex         *string
@@ -216,6 +218,8 @@ func Parse() *Options {
 	viper.SetDefault("argocd-chart-url", DefaultArgocdChartURL)
 	viper.SetDefault("log-format", DefaultLogFormat)
 	viper.SetDefault("title", DefaultTitle)
+	viper.SetDefault("apps-of-apps", false)
+	viper.SetDefault("apps-of-apps-max-depth", 2)
 
 	// Basic flags
 	rootCmd.Flags().BoolP("debug", "d", false, "Activate debug mode")
@@ -258,6 +262,8 @@ func Parse() *Options {
 	rootCmd.Flags().Bool("ignore-invalid-watch-pattern", false, "Ignore invalid watch pattern Regex on Applications")
 	rootCmd.Flags().String("redirect-target-revisions", "", "List of target revisions to redirect")
 	rootCmd.Flags().String("title", DefaultTitle, "Custom title for the markdown output")
+	rootCmd.Flags().Bool("apps-of-apps", false, "Enable Apps of Apps expansion (discover child Applications)")
+	rootCmd.Flags().Int("apps-of-apps-max-depth", 2, "Max depth for Apps of Apps expansion")
 
 	// Check if version flag was specified directly
 	for _, arg := range os.Args[1:] {
@@ -454,6 +460,12 @@ func (o *Options) LogOptions() {
 	if o.Title != DefaultTitle {
 		log.Info().Msgf("✨ - title: %s", o.Title)
 	}
+	if o.AppsOfApps {
+		log.Info().Msgf("✨ - apps-of-apps: %t", o.AppsOfApps)
+		if o.AppsOfAppsMaxDepth != 0 {
+			log.Info().Msgf("✨ - apps-of-apps-max-depth: %d", o.AppsOfAppsMaxDepth)
+		}
+	}
 }
 
 // GetFileRegex returns the parsed regex
@@ -479,4 +491,13 @@ func (o *Options) GetRedirectRevisions() []string {
 // GetClusterProvider returns the cluster provider
 func (o *Options) GetClusterProvider() cluster.Provider {
 	return o.clusterProvider
+}
+
+// GetAppsOfApps returns whether apps-of-apps is enabled and the max depth
+func (o *Options) GetAppsOfApps() (bool, int) {
+	depth := o.AppsOfAppsMaxDepth
+	if depth <= 0 {
+		depth = 1
+	}
+	return o.AppsOfApps, depth
 }

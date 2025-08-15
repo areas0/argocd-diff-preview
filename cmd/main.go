@@ -190,6 +190,38 @@ func run(opts *Options) error {
 		return err
 	}
 
+	// Optionally expand Applications-of-Applications
+	enabled, maxDepth := opts.GetAppsOfApps()
+	if enabled {
+		appsOfAppsOpts := argoapplication.AppsOfAppsOptions{
+			Enabled:           true,
+			MaxDepth:          maxDepth,
+			TempFolder:        fmt.Sprintf("%s/apps-of-apps", tempFolder),
+			Debug:             opts.Debug,
+			Repo:              opts.Repo,
+			RedirectRevisions: redirectRevisions,
+			FilterOptions:     filterOptions,
+			ArgoCDNamespace:   opts.ArgocdNamespace,
+			RunPrefix:         uniqueID,
+		}
+
+		baseApps, targetApps, err = argoapplication.ExpandAppsOfAppsInBothBranches(
+			argocd,
+			baseApps,
+			targetApps,
+			baseBranch,
+			targetBranch,
+			appsOfAppsOpts,
+		)
+		if err != nil {
+			log.Error().Msgf("❌ Failed to expand Applications of Applications")
+			return err
+		}
+
+		// Remove duplicates introduced by expansion
+		baseApps, targetApps = duplicates.RemoveDuplicates(baseApps, targetApps)
+	}
+
 	// Check for duplicates again
 	baseApps, targetApps = duplicates.RemoveDuplicates(baseApps, targetApps)
 
