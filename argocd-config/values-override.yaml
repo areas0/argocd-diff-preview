@@ -6,7 +6,13 @@ dex:
   enabled: false
 configs:
   params:
-    reposerver.git.request.timeout: "150s"
+    # Timeout for git requests from repo-server (fetch/clone). Increase for large repos.
+    reposerver.git.request.timeout: "1000s"
+    # Timeout for application-controller RPC calls to repo-server when generating manifests.
+    # Default is 60s; large charts may need significantly more.
+    controller.repo.server.timeout.seconds: "1000"
+    # Timeout for argocd-server RPC calls to repo-server (used by CLI operations like `argocd app manifests`).
+    server.repo.server.timeout.seconds: "1000"
 # Readiness probe settings have been adjusted to start checks immediately (initialDelaySeconds: 0)
 # The failureThreshold is increased to ensure the total time before a pod is marked unhealthy remains similar to the default
 # This default duration is calculated using the original values from values.yaml for (initialDelaySeconds + failureThreshold * periodSeconds)
@@ -31,6 +37,11 @@ repoServer:
     successThreshold: 1
     timeoutSeconds: 1
     failureThreshold: 40
+  env:
+  - name: ARGOCD_EXEC_TIMEOUT
+    value: "1000s"
+  - name: ARGOCD_EXEC_FATAL_TIMEOUT
+    value: "1100s"
 applicationSet:
   readinessProbe:
     initialDelaySeconds: 0

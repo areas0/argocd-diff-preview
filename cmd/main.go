@@ -258,12 +258,133 @@ func run(opts *Options) error {
 		return err
 	}
 
-	baseAppInfos, err := convertExtractedAppsToAppInfos(baseManifests)
+	// Aggregate manifests and iteratively render nested Applications/ApplicationSets
+	var totalExtractDuration time.Duration
+	totalExtractDuration += extractDuration
+
+	aggregatedBase := append([]extract.ExtractedApp{}, baseManifests...)
+	aggregatedTarget := append([]extract.ExtractedApp{}, targetManifests...)
+
+	// Track seen applications per branch/kind/name to avoid reprocessing
+	seen := make(map[string]struct{})
+	for _, a := range baseApps {
+		seen[keyForSeen(a.Branch, a.Kind.ShortName(), a.Name)] = struct{}{}
+	}
+	for _, a := range targetApps {
+		seen[keyForSeen(a.Branch, a.Kind.ShortName(), a.Name)] = struct{}{}
+	}
+
+	// Keep only the most recent iteration's extracted apps for discovery
+	currentBaseExtracted := baseManifests
+	currentTargetExtracted := targetManifests
+
+	maxIterations := 5
+	for iter := 1; iter <= maxIterations; iter++ {
+		// Discover new Argo Applications/ApplicationSets from the last extraction
+		discoveredBase := discoverChildArgoResources(currentBaseExtracted)
+		discoveredTarget := discoverChildArgoResources(currentTargetExtracted)
+
+		// Filter out already seen apps
+		filterNew := func(in []argoapplication.ArgoResource) []argoapplication.ArgoResource {
+			var out []argoapplication.ArgoResource
+			for _, r := range in {
+				k := keyForSeen(r.Branch, r.Kind.ShortName(), r.Name)
+				if _, ok := seen[k]; ok {
+					continue
+				}
+				seen[k] = struct{}{}
+				out = append(out, r)
+			}
+			return out
+		}
+
+		discoveredBase = filterNew(discoveredBase)
+		discoveredTarget = filterNew(discoveredTarget)
+
+		if len(discoveredBase) == 0 && len(discoveredTarget) == 0 {
+			log.Info().Msg("🧭 No new Applications or ApplicationSets discovered from manifests. Stopping iterative rendering.")
+			break
+		}
+
+		log.Info().Msgf("🔁 Iteration %d: discovered %d base and %d target nested Application[Sets]", iter, len(discoveredBase), len(discoveredTarget))
+
+		// Patch newly discovered apps per branch
+		patchedBase, err := argoapplication.PatchApplications(
+			opts.ArgocdNamespace, discoveredBase, baseBranch, opts.Repo, redirectRevisions,
+		)
+		if err != nil {
+			log.Error().Msg("❌ Failed to patch discovered base apps")
+			return err
+		}
+		patchedTarget, err := argoapplication.PatchApplications(
+			opts.ArgocdNamespace, discoveredTarget, targetBranch, opts.Repo, redirectRevisions,
+		)
+		if err != nil {
+			log.Error().Msg("❌ Failed to patch discovered target apps")
+			return err
+		}
+
+		// Remove duplicates across branches
+		patchedBase, patchedTarget = duplicates.RemoveDuplicates(patchedBase, patchedTarget)
+
+		// Ensure unique IDs
+		patchedBase = argoapplication.UniqueIds(patchedBase, baseBranch)
+		patchedTarget = argoapplication.UniqueIds(patchedTarget, targetBranch)
+
+		// Convert any ApplicationSets among the discovered to Applications
+		patchedBase, patchedTarget, err = argoapplication.ConvertAppSetsToAppsInBothBranches(
+			argocd,
+			patchedBase,
+			patchedTarget,
+			baseBranch,
+			targetBranch,
+			opts.Repo,
+			tempFolder,
+			redirectRevisions,
+			opts.Debug,
+			argoapplication.FilterOptions{}, // Do not filter nested apps by selectors/changed files
+		)
+		if err != nil {
+			log.Error().Msg("❌ Failed to convert nested ApplicationSets to Applications")
+			return err
+		}
+
+		// Ensure unique IDs again after conversion
+		patchedBase = argoapplication.UniqueIds(patchedBase, baseBranch)
+		patchedTarget = argoapplication.UniqueIds(patchedTarget, targetBranch)
+
+		// Extract resources for newly discovered apps
+		nb, nt, dur, err := extract.GetResourcesFromBothBranches(
+			argocd,
+			opts.Timeout,
+			patchedBase,
+			patchedTarget,
+			uniqueID,
+			deleteAfterProcessing,
+		)
+		if err != nil {
+			log.Error().Msg("❌ Failed to extract resources for nested apps")
+			return err
+		}
+
+		totalExtractDuration += dur
+
+		// Append to aggregates
+		aggregatedBase = append(aggregatedBase, nb...)
+		aggregatedTarget = append(aggregatedTarget, nt...)
+
+		// Prepare for next iteration discovery
+		currentBaseExtracted = nb
+		currentTargetExtracted = nt
+	}
+
+	// Convert final aggregated manifests to AppInfos
+	baseAppInfos, err := convertExtractedAppsToAppInfos(aggregatedBase)
 	if err != nil {
 		log.Error().Msg("❌ Failed to convert extracted apps to yaml")
 		return err
 	}
-	targetAppInfos, err := convertExtractedAppsToAppInfos(targetManifests)
+	targetAppInfos, err := convertExtractedAppsToAppInfos(aggregatedTarget)
 	if err != nil {
 		log.Error().Msg("❌ Failed to convert extracted apps to yaml")
 		return err
@@ -295,7 +416,7 @@ func run(opts *Options) error {
 
 	// Create info box for storing run time information
 	infoBox := diff.InfoBox{
-		ExtractDuration:            extractDuration,
+		ExtractDuration:            totalExtractDuration,
 		ArgoCDInstallationDuration: argocdInstallationDuration,
 		ClusterCreationDuration:    clusterCreationDuration,
 		FullDuration:               time.Since(startTime),
@@ -362,4 +483,46 @@ func convertToYamlString(apps *extract.ExtractedApp) (string, error) {
 		manifestStrings = append(manifestStrings, string(manifestString))
 	}
 	return strings.Join(manifestStrings, "\n---\n"), nil
+}
+
+// keyForSeen builds a unique key for tracking discovered apps across iterations
+func keyForSeen(branch git.BranchType, kind string, name string) string {
+	return fmt.Sprintf("%s|%s|%s", branch, kind, name)
+}
+
+// discoverChildArgoResources scans extracted manifests for Argo CD Application or ApplicationSet resources
+// and returns them as ArgoResources so they can be patched and extracted in subsequent iterations.
+func discoverChildArgoResources(extracted []extract.ExtractedApp) []argoapplication.ArgoResource {
+	var out []argoapplication.ArgoResource
+	for _, app := range extracted {
+		for _, obj := range app.Manifest {
+			kind := obj.GetKind()
+			if kind != "Application" && kind != "ApplicationSet" {
+				continue
+			}
+
+			name := obj.GetName()
+			if name == "" {
+				continue
+			}
+
+			var k argoapplication.ApplicationKind
+			switch kind {
+			case "Application":
+				k = argoapplication.Application
+			case "ApplicationSet":
+				k = argoapplication.ApplicationSet
+			}
+
+			// Use the extracted app's SourcePath as the FileName for traceability
+			// Note: We create a deep copy to avoid mutating the original unstructured object
+			copy := obj.DeepCopy()
+			res := argoapplication.NewArgoResource(copy, k, name, name, app.SourcePath, app.Branch)
+			out = append(out, *res)
+		}
+	}
+	if len(out) > 0 {
+		log.Info().Msgf("🔎 Discovered %d nested Application[Sets] from manifests", len(out))
+	}
+	return out
 }
