@@ -64,6 +64,7 @@ pre {
 </div>
 
 <pre>%info_box%</pre>
+%warnings_section%
 </div>
 </body>
 </html>
@@ -84,11 +85,12 @@ const htmlSection = `
 
 const htmlLine = `<tr class="%s"><td><pre>%s</pre></td></tr>`
 
-func printHTMLDiff(title, summary, diff string, infoBox string) string {
+func printHTMLDiff(title, summary, diff string, infoBox string, warnings string) string {
 	htmlDiff := strings.ReplaceAll(htmlTemplate, "%title%", title)
 	htmlDiff = strings.ReplaceAll(htmlDiff, "%summary%", summary)
 	htmlDiff = strings.ReplaceAll(htmlDiff, "%app_diffs%", diff)
 	htmlDiff = strings.ReplaceAll(htmlDiff, "%info_box%", infoBox)
+	htmlDiff = strings.ReplaceAll(htmlDiff, "%warnings_section%", warnings)
 	return strings.TrimSpace(htmlDiff) + "\n"
 }
 

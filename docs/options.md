@@ -50,3 +50,4 @@ argocd-diff-preview [FLAGS] [OPTIONS] --repo <repo> --target-branch <target-bran
 | `--selector <selector>`, `-l` | `SELECTOR` | - | Label selector to filter on (e.g., `key1=value1,key2=value2`) |
 | `--timeout <seconds>` | `TIMEOUT` | `180` | Set timeout in seconds |
 | `--title <title>` | `TITLE` | `Argo CD Diff Preview` | Custom title for the markdown output |
+| `--render-errors-as-warnings` | `RENDER_ERRORS_AS_WARNINGS` | `false` | Treat render errors as warnings and include them in the report |

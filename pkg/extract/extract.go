@@ -54,6 +54,15 @@ type ExtractedApp struct {
 	Branch     git.BranchType
 }
 
+// Warning represents a non-fatal issue encountered while rendering an app
+type Warning struct {
+	AppId      string
+	AppName    string
+	SourcePath string
+	Branch     git.BranchType
+	Message    string
+}
+
 // CreateExtractedApp creates an ExtractedApp from an ArgoResource
 func CreateExtractedApp(id string, name string, sourcePath string, manifest []unstructured.Unstructured, branch git.BranchType) ExtractedApp {
 	return ExtractedApp{
@@ -74,27 +83,28 @@ func GetResourcesFromBothBranches(
 	targetApps []argoapplication.ArgoResource,
 	prefix string,
 	deleteAfterProcessing bool,
-) ([]ExtractedApp, []ExtractedApp, time.Duration, error) {
+	renderErrorsAsWarnings bool,
+) ([]ExtractedApp, []ExtractedApp, []Warning, time.Duration, error) {
 	startTime := time.Now()
 
 	if err := verifyNoDuplicateAppIds(baseApps); err != nil {
-		return nil, nil, time.Since(startTime), err
+		return nil, nil, nil, time.Since(startTime), err
 	}
 
 	if err := verifyNoDuplicateAppIds(targetApps); err != nil {
-		return nil, nil, time.Since(startTime), err
+		return nil, nil, nil, time.Since(startTime), err
 	}
 
 	apps := append(baseApps, targetApps...)
 
 	log.Debug().Msg("Applied manifest for both branches")
-	extractedBaseApps, extractedTargetApps, err := getResourcesFromApps(argocd, apps, timeout, prefix, deleteAfterProcessing)
+	extractedBaseApps, extractedTargetApps, warnings, err := getResourcesFromApps(argocd, apps, timeout, prefix, deleteAfterProcessing, renderErrorsAsWarnings)
 	if err != nil {
-		return nil, nil, time.Since(startTime), fmt.Errorf("failed to get resources: %w", err)
+		return nil, nil, nil, time.Since(startTime), fmt.Errorf("failed to get resources: %w", err)
 	}
 	log.Debug().Msg("Extracted manifests for both branches")
 
-	return extractedBaseApps, extractedTargetApps, time.Since(startTime), nil
+	return extractedBaseApps, extractedTargetApps, warnings, time.Since(startTime), nil
 }
 
 func verifyNoDuplicateAppIds(apps []argoapplication.ArgoResource) error {
@@ -115,7 +125,8 @@ func getResourcesFromApps(
 	timeout uint64,
 	prefix string,
 	deleteAfterProcessing bool,
-) ([]ExtractedApp, []ExtractedApp, error) {
+	renderErrorsAsWarnings bool,
+) ([]ExtractedApp, []ExtractedApp, []Warning, error) {
 	startTime := time.Now()
 
 	log.Info().Msg("🤖 Getting Applications")
@@ -124,6 +135,7 @@ func getResourcesFromApps(
 	results := make(chan struct {
 		app ExtractedApp
 		err error
+		src argoapplication.ArgoResource
 	}, len(apps))
 
 	// Create a semaphore channel to limit concurrent workers
@@ -141,7 +153,8 @@ func getResourcesFromApps(
 			results <- struct {
 				app ExtractedApp
 				err error
-			}{app: result, err: err}
+				src argoapplication.ArgoResource
+			}{app: result, err: err, src: app}
 
 			// release semaphore
 			<-sem
@@ -162,6 +175,7 @@ func getResourcesFromApps(
 	extractedBaseApps := make([]ExtractedApp, 0, len(apps))
 	extractedTargetApps := make([]ExtractedApp, 0, len(apps))
 	var firstError error
+	var warnings []Warning
 
 	// Setup progress tracking
 	totalApps := len(apps)
@@ -187,6 +201,20 @@ func getResourcesFromApps(
 	for i := 0; i < len(apps); i++ {
 		result := <-results
 		if result.err != nil {
+			// Attempt to build warning if configured
+			if renderErrorsAsWarnings {
+				// Try to parse minimal details from the app that failed by inspecting the error and result.app
+				w := Warning{
+					AppId:      appIdFromErrOrExtract(result),
+					AppName:    appNameFromErrOrExtract(result),
+					SourcePath: appSourceFromErrOrExtract(result),
+					Branch:     appBranchFromErrOrExtract(result),
+					Message:    result.err.Error(),
+				}
+				warnings = append(warnings, w)
+				log.Warn().Str("App", w.AppName).Msgf("⚠️ Treating render error as warning: %s", w.Message)
+				continue
+			}
 			if firstError == nil {
 				firstError = result.err
 			}
@@ -199,7 +227,7 @@ func getResourcesFromApps(
 		case git.Target:
 			extractedTargetApps = append(extractedTargetApps, result.app)
 		default:
-			return nil, nil, fmt.Errorf("unknown branch type: '%s'", result.app.Branch)
+			return nil, nil, nil, fmt.Errorf("unknown branch type: '%s'", result.app.Branch)
 		}
 		renderedApps++
 	}
@@ -207,8 +235,8 @@ func getResourcesFromApps(
 	// Signal progress reporting to stop
 	close(progressDone)
 
-	if firstError != nil {
-		return nil, nil, firstError
+	if firstError != nil && !renderErrorsAsWarnings {
+		return nil, nil, nil, firstError
 	}
 
 	// Wait for all goroutines to complete (including deletions)
@@ -219,7 +247,55 @@ func getResourcesFromApps(
 	duration := time.Since(startTime)
 	log.Info().Msgf("🤖 Got all resources from %d applications from %s-branch and got %d from %s-branch in %s", len(extractedBaseApps), git.Base, len(extractedTargetApps), git.Target, duration.Round(time.Second))
 
-	return extractedBaseApps, extractedTargetApps, nil
+	return extractedBaseApps, extractedTargetApps, warnings, nil
+}
+
+// helper accessors to avoid additional parsing; fall back to empty values gracefully
+func appIdFromErrOrExtract(r struct {
+	app ExtractedApp
+	err error
+	src argoapplication.ArgoResource
+}) string {
+	if r.app.Id != "" {
+		return r.app.Id
+	}
+	return r.src.Id
+}
+func appNameFromErrOrExtract(r struct {
+	app ExtractedApp
+	err error
+	src argoapplication.ArgoResource
+}) string {
+	if r.app.Name != "" {
+		return r.app.Name
+	}
+	return ifEmpty(r.src.Name, r.src.Id)
+}
+func appSourceFromErrOrExtract(r struct {
+	app ExtractedApp
+	err error
+	src argoapplication.ArgoResource
+}) string {
+	if r.app.SourcePath != "" {
+		return r.app.SourcePath
+	}
+	return r.src.FileName
+}
+func appBranchFromErrOrExtract(r struct {
+	app ExtractedApp
+	err error
+	src argoapplication.ArgoResource
+}) git.BranchType {
+	if r.app.Branch != "" {
+		return r.app.Branch
+	}
+	return r.src.Branch
+}
+func ifEmpty(s, fallback string) string {
+	if s == "" {
+		return fallback
+	}
+	return s
 }
 
 // getResourcesFromApp extracts a single application from the cluster

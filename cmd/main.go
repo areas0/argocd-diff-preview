@@ -245,13 +245,14 @@ func run(opts *Options) error {
 
 	// Extract resources from the cluster based on each branch, passing the manifests directly
 	deleteAfterProcessing := !opts.CreateCluster
-	baseManifests, targetManifests, extractDuration, err := extract.GetResourcesFromBothBranches(
+	baseManifests, targetManifests, warnings1, extractDuration, err := extract.GetResourcesFromBothBranches(
 		argocd,
 		opts.Timeout,
 		baseApps,
 		targetApps,
 		uniqueID,
 		deleteAfterProcessing,
+		opts.RenderErrorsAsWarnings,
 	)
 	if err != nil {
 		log.Error().Msg("❌ Failed to extract resources")
@@ -277,6 +278,7 @@ func run(opts *Options) error {
 	// Keep only the most recent iteration's extracted apps for discovery
 	currentBaseExtracted := baseManifests
 	currentTargetExtracted := targetManifests
+	collectedWarnings := warnings1
 
 	maxIterations := 5
 	for iter := 1; iter <= maxIterations; iter++ {
@@ -354,13 +356,14 @@ func run(opts *Options) error {
 		patchedTarget = argoapplication.UniqueIds(patchedTarget, targetBranch)
 
 		// Extract resources for newly discovered apps
-		nb, nt, dur, err := extract.GetResourcesFromBothBranches(
+		nb, nt, w, dur, err := extract.GetResourcesFromBothBranches(
 			argocd,
 			opts.Timeout,
 			patchedBase,
 			patchedTarget,
 			uniqueID,
 			deleteAfterProcessing,
+			opts.RenderErrorsAsWarnings,
 		)
 		if err != nil {
 			log.Error().Msg("❌ Failed to extract resources for nested apps")
@@ -372,6 +375,7 @@ func run(opts *Options) error {
 		// Append to aggregates
 		aggregatedBase = append(aggregatedBase, nb...)
 		aggregatedTarget = append(aggregatedTarget, nt...)
+		collectedWarnings = append(collectedWarnings, w...)
 
 		// Prepare for next iteration discovery
 		currentBaseExtracted = nb
@@ -424,6 +428,14 @@ func run(opts *Options) error {
 	}
 
 	// Generate diff between base and target branches
+	// Convert warnings to strings for rendering in report
+	var warningsStr []string
+	if len(collectedWarnings) > 0 {
+		for _, w := range collectedWarnings {
+			warningsStr = append(warningsStr, fmt.Sprintf("%s [%s/%s] (%s): %s", w.AppName, w.Branch, w.AppId, w.SourcePath, w.Message))
+		}
+	}
+
 	if err := diff.GenerateDiff(
 		opts.Title,
 		opts.OutputFolder,
@@ -435,6 +447,7 @@ func run(opts *Options) error {
 		opts.LineCount,
 		opts.MaxDiffLength,
 		infoBox,
+		warningsStr,
 	); err != nil {
 		log.Error().Msg("❌ Failed to generate diff")
 		return err

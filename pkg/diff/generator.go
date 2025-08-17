@@ -3,6 +3,7 @@ package diff
 import (
 	"bytes"
 	"fmt"
+	"html"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,6 +38,7 @@ func GenerateDiff(
 	lineCount uint,
 	maxCharCount uint,
 	timeInfo InfoBox,
+	warnings []string,
 ) error {
 
 	maxDiffMessageCharCount := maxCharCount
@@ -126,11 +128,35 @@ func GenerateDiff(
 	}
 
 	// Generate and write markdown
+	// Build warnings section
+	var warningsMarkdown, warningsHTML string
+	if len(warnings) > 0 {
+		var b strings.Builder
+		b.WriteString("\n\n## Warnings\n\n")
+		for _, w := range warnings {
+			b.WriteString("- ")
+			b.WriteString(w)
+			b.WriteString("\n")
+		}
+		warningsMarkdown = b.String()
+
+		var hb strings.Builder
+		hb.WriteString("\n\n<h2>Warnings</h2>\n<ul>\n")
+		for _, w := range warnings {
+			hb.WriteString("<li>")
+			hb.WriteString(html.EscapeString(w))
+			hb.WriteString("</li>\n")
+		}
+		hb.WriteString("</ul>\n")
+		warningsHTML = hb.String()
+	}
+
 	markdown := printMarkdownDiff(
 		title,
 		strings.TrimSpace(summary),
 		strings.TrimSpace(markdownCombinedDiff.String()),
 		infoBoxString,
+		warningsMarkdown,
 	)
 	markdownPath := fmt.Sprintf("%s/diff.md", outputFolder)
 	if err := utils.WriteFile(markdownPath, markdown); err != nil {
@@ -143,6 +169,7 @@ func GenerateDiff(
 		strings.TrimSpace(summary),
 		strings.TrimSpace(htmlCombinedDiff.String()),
 		infoBoxString,
+		warningsHTML,
 	)
 	htmlPath := fmt.Sprintf("%s/diff.html", outputFolder)
 	if err := utils.WriteFile(htmlPath, htmlDiff); err != nil {

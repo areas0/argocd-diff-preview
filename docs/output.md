@@ -18,3 +18,7 @@ The tool creates an HTML file at `./output/diff.html`.
 After rendering the manifests for each branch, the tool stores the compared output in two files: `./output/base-branch.yaml` and `./output/target-branch.yaml`. These files are long YAML documents containing all the rendered manifests.
 
 You can pass this output into any tool you like. For example, you could feed those files into [kube-score](https://github.com/zegl/kube-score) to check whether the score of your new branch goes up or down.
+
+## Warnings section
+
+If you enable `--render-errors-as-warnings`, any applications that failed to render will be listed at the end of the report under a "Warnings" section, instead of failing the run. This helps surface issues without blocking the diff.
