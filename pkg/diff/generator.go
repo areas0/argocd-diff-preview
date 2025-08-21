@@ -1,3 +1,4 @@
+// Package diff generates human-friendly diffs between sets of rendered manifests.
 package diff
 
 import (
@@ -6,6 +7,8 @@ import (
 	"html"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -17,10 +20,15 @@ import (
 
 	gitt "github.com/dag-andersen/argocd-diff-preview/pkg/git"
 	"github.com/dag-andersen/argocd-diff-preview/pkg/utils"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"sigs.k8s.io/yaml"
 )
 
+// AppInfo describes an application manifest artifact used to compute diffs.
 type AppInfo struct {
-	Id          string
+	// Id holds the filename/id of the manifest artifact. Kept as 'Id' for backward compatibility.
+	//lint:ignore ST1003 legacy field name; keep API compatibility
+	Id          string //nolint:stylecheck,revive // legacy field name; keep API compatibility
 	Name        string
 	SourcePath  string
 	FileContent string
@@ -331,6 +339,7 @@ func generateGitDiff(
 		}
 
 		diffContent := ""
+		var oldContent, newContent string
 
 		switch action {
 		case merkletrie.Insert:
@@ -346,6 +355,7 @@ func generateGitDiff(
 					return "", nil, nil, fmt.Errorf("failed to read target blob: %w", err)
 				}
 
+				newContent = content
 				diffContent = formatNewFileDiff(content, diffContextLines, diffIgnore)
 			}
 
@@ -362,13 +372,14 @@ func generateGitDiff(
 					return "", nil, nil, fmt.Errorf("failed to read base blob: %w", err)
 				}
 
+				oldContent = content
 				diffContent = formatDeletedFileDiff(content, diffContextLines, diffIgnore)
 			}
 
 		case merkletrie.Modify:
 
 			// Get content of both files and use the diff package
-			var oldContent, newContent string
+			var oldC, newC string
 
 			if from != nil {
 				blob, err := repo.BlobObject(from.Hash)
@@ -376,7 +387,7 @@ func generateGitDiff(
 					return "", nil, nil, fmt.Errorf("failed to get base blob: %w", err)
 				}
 
-				oldContent, err = getBlobContent(blob)
+				oldC, err = getBlobContent(blob)
 				if err != nil {
 					return "", nil, nil, fmt.Errorf("failed to read base blob: %w", err)
 				}
@@ -388,14 +399,16 @@ func generateGitDiff(
 					return "", nil, nil, fmt.Errorf("failed to get target blob: %w", err)
 				}
 
-				newContent, err = getBlobContent(blob)
+				newC, err = getBlobContent(blob)
 				if err != nil {
 					return "", nil, nil, fmt.Errorf("failed to read target blob: %w", err)
 				}
 			}
 
 			// Use diff.Do to generate the diff
-			diffContent = formatModifiedFileDiff(oldContent, newContent, diffContextLines, diffIgnore)
+			oldContent = oldC
+			newContent = newC
+			diffContent = formatModifiedFileDiff(oldC, newC, diffContextLines, diffIgnore)
 		}
 
 		toName := ""
@@ -407,6 +420,8 @@ func generateGitDiff(
 			fromName = from.Name
 		}
 
+		rd := buildResourceDiffs(oldContent, newContent, action, diffContextLines, diffIgnore)
+
 		diff := Diff{
 			newName:       targetAppsMap[toName].Name,
 			oldName:       baseAppsMap[fromName].Name,
@@ -414,10 +429,11 @@ func generateGitDiff(
 			oldSourcePath: baseAppsMap[fromName].SourcePath,
 			action:        action,
 			content:       diffContent,
+			resourceDiffs: rd,
 		}
 
 		// If the diff didn't change and the names are the same, skip it
-		if diff.content == "" && diff.oldName == diff.newName && diff.oldSourcePath == diff.newSourcePath {
+		if diff.content == "" && len(diff.resourceDiffs) == 0 && diff.oldName == diff.newName && diff.oldSourcePath == diff.newSourcePath {
 			continue
 		}
 
@@ -446,7 +462,7 @@ func generateGitDiff(
 	for _, diff := range changedFiles {
 
 		// skips empty diffs
-		if diff.content == "" {
+		if diff.content == "" && len(diff.resourceDiffs) == 0 {
 			continue
 		}
 
@@ -459,6 +475,152 @@ func generateGitDiff(
 	}
 
 	return summary, markdownFileSections, htmlFileSections, nil
+}
+
+// --- Resource level diff helpers ---
+
+// parseManifests splits a YAML multi-doc stream into Kubernetes resources
+func parseManifests(stream string) ([]unstructured.Unstructured, error) {
+	// quick exit
+	s := strings.TrimSpace(stream)
+	if s == "" {
+		return nil, nil
+	}
+	// Split on YAML document separator lines
+	documentSeparator := regexp.MustCompile(`(?m)^---\s*$`)
+	documents := documentSeparator.Split(stream, -1)
+	manifests := make([]unstructured.Unstructured, 0, len(documents))
+	for _, doc := range documents {
+		trimmed := strings.TrimSpace(doc)
+		if trimmed == "" {
+			continue
+		}
+		var obj map[string]interface{}
+		if err := yaml.Unmarshal([]byte(trimmed), &obj); err != nil {
+			// Not a parseable YAML document; skip resource-level splitting
+			return nil, fmt.Errorf("failed to parse YAML doc: %w", err)
+		}
+		if len(obj) == 0 {
+			continue
+		}
+		// Validate as k8s resource
+		apiVersion, _, _ := unstructured.NestedString(obj, "apiVersion")
+		kind, _, _ := unstructured.NestedString(obj, "kind")
+		if apiVersion == "" || kind == "" {
+			// Not a k8s resource, skip
+			continue
+		}
+		manifests = append(manifests, unstructured.Unstructured{Object: obj})
+	}
+	return manifests, nil
+}
+
+func makeResourceKey(u unstructured.Unstructured) resourceKey {
+	name, _, _ := unstructured.NestedString(u.Object, "metadata", "name")
+	ns, _, _ := unstructured.NestedString(u.Object, "metadata", "namespace")
+	apiVersion, _, _ := unstructured.NestedString(u.Object, "apiVersion")
+	kind, _, _ := unstructured.NestedString(u.Object, "kind")
+	return resourceKey{APIVersion: apiVersion, Kind: kind, Namespace: ns, Name: name}
+}
+
+func marshalResourceYAML(u unstructured.Unstructured) string {
+	b, err := yaml.Marshal(u.Object)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// buildResourceDiffs computes resource-level diffs given old/new YAML streams and action
+func buildResourceDiffs(oldContent, newContent string, action merkletrie.Action, diffContextLines uint, ignorePattern *string) []resourceDiff {
+	// Try to parse; if parsing fails on one side, we'll return empty to fallback to file-level view
+	switch action {
+	case merkletrie.Insert:
+		newRes, err := parseManifests(newContent)
+		if err != nil || len(newRes) == 0 {
+			return nil
+		}
+		rds := make([]resourceDiff, 0, len(newRes))
+		for _, u := range newRes {
+			yamlStr := marshalResourceYAML(u)
+			rds = append(rds, resourceDiff{
+				key:     makeResourceKey(u),
+				action:  merkletrie.Insert,
+				content: formatNewFileDiff(yamlStr, diffContextLines, ignorePattern),
+			})
+		}
+		return rds
+	case merkletrie.Delete:
+		oldRes, err := parseManifests(oldContent)
+		if err != nil || len(oldRes) == 0 {
+			return nil
+		}
+		rds := make([]resourceDiff, 0, len(oldRes))
+		for _, u := range oldRes {
+			yamlStr := marshalResourceYAML(u)
+			rds = append(rds, resourceDiff{
+				key:     makeResourceKey(u),
+				action:  merkletrie.Delete,
+				content: formatDeletedFileDiff(yamlStr, diffContextLines, ignorePattern),
+			})
+		}
+		return rds
+	case merkletrie.Modify:
+		oldRes, err1 := parseManifests(oldContent)
+		newRes, err2 := parseManifests(newContent)
+		if err1 != nil || err2 != nil {
+			return nil
+		}
+		if len(oldRes) == 0 && len(newRes) == 0 {
+			return nil
+		}
+		oldMap := map[resourceKey]string{}
+		for _, u := range oldRes {
+			oldMap[makeResourceKey(u)] = marshalResourceYAML(u)
+		}
+		newMap := map[resourceKey]string{}
+		for _, u := range newRes {
+			newMap[makeResourceKey(u)] = marshalResourceYAML(u)
+		}
+		// union of keys
+		type pair struct {
+			k resourceKey
+			t string
+		}
+		keys := make([]pair, 0, len(oldMap)+len(newMap))
+		seen := map[resourceKey]bool{}
+		for k := range oldMap {
+			keys = append(keys, pair{k, "o"})
+			seen[k] = true
+		}
+		for k := range newMap {
+			if !seen[k] {
+				keys = append(keys, pair{k, "n"})
+			}
+		}
+		// deterministic order: sort by String()
+		sort.Slice(keys, func(i, j int) bool { return keys[i].k.String() < keys[j].k.String() })
+		rds := make([]resourceDiff, 0, len(keys))
+		for _, p := range keys {
+			k := p.k
+			oldY, oldOk := oldMap[k]
+			newY, newOk := newMap[k]
+			switch {
+			case oldOk && !newOk:
+				rds = append(rds, resourceDiff{key: k, action: merkletrie.Delete, content: formatDeletedFileDiff(oldY, diffContextLines, ignorePattern)})
+			case !oldOk && newOk:
+				rds = append(rds, resourceDiff{key: k, action: merkletrie.Insert, content: formatNewFileDiff(newY, diffContextLines, ignorePattern)})
+			case oldOk && newOk:
+				c := formatModifiedFileDiff(oldY, newY, diffContextLines, ignorePattern)
+				if strings.TrimSpace(c) != "" {
+					rds = append(rds, resourceDiff{key: k, action: merkletrie.Modify, content: c})
+				}
+			}
+		}
+		return rds
+	default:
+		return nil
+	}
 }
 
 // getBlobContent reads the content of a Git blob
