@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 	"github.com/argoproj/argo-cd/v3/util/db"
@@ -32,7 +33,8 @@ import (
 
 // RepoCreds is a pre-fetched snapshot of all repository credentials registered
 // in the ArgoCD installation. It is built once and shared across all concurrent
-// rendering goroutines (it is read-only after construction).
+// rendering goroutines. The reposByURL map may be lazily extended when GetRepo
+// encounters an unknown URL — a mutex protects concurrent access.
 type RepoCreds struct {
 	// helmRepos is the list of all Helm repositories registered in ArgoCD.
 	// Passed as ManifestRequest.Repos to cover Helm chart sub-dependencies.
@@ -53,6 +55,19 @@ type RepoCreds struct {
 	// reposByURL is a map from normalised repository URL → fully-enriched
 	// Repository struct (with credentials). Used to populate ManifestRequest.Repo.
 	reposByURL map[string]*v1alpha1.Repository
+
+	// mu protects reposByURL for concurrent lazy resolution in GetRepo.
+	mu sync.Mutex
+
+	// argoDB is retained for lazy credential resolution: when GetRepo encounters
+	// a URL not in reposByURL, it calls argoDB.GetRepository to resolve
+	// credentials via repo-creds prefix matching. This is essential for
+	// --traverse-app-of-apps where child apps reference repo URLs not known
+	// at initial FetchRepoCreds time.
+	argoDB db.ArgoDB
+
+	// ctx is the context used for lazy argoDB calls.
+	ctx context.Context
 }
 
 // FetchRepoCreds connects to the cluster via the ArgoCD DB layer and fetches
@@ -160,20 +175,48 @@ func FetchRepoCreds(ctx context.Context, k8sClient *k8s.Client, namespace string
 		helmRepoCreds: helmRepoCreds,
 		ociRepoCreds:  ociRepoCreds,
 		reposByURL:    reposByURL,
+		argoDB:        argoDB,
+		ctx:           ctx,
 	}, nil
 }
 
 // GetRepo returns the credential-enriched Repository for the given URL.
-// If no registered repository matches the URL exactly, it returns a stub
-// Repository with just the URL set (the same bare-URL behaviour as before
-// this fix, so callers can always proceed).
+// If no registered repository matches the URL exactly, it attempts lazy
+// resolution via argoDB.GetRepository (which applies repo-creds prefix
+// matching). This is essential for --traverse-app-of-apps where child apps
+// reference repo URLs not known at initial FetchRepoCreds time.
+// If resolution fails or yields no credentials, it returns a bare stub.
 func (rc *RepoCreds) GetRepo(repoURL string) *v1alpha1.Repository {
 	if rc == nil {
 		return &v1alpha1.Repository{Repo: repoURL}
 	}
-	if r, ok := rc.reposByURL[normalizeRepoURL(repoURL)]; ok {
+	key := normalizeRepoURL(repoURL)
+
+	rc.mu.Lock()
+	r, ok := rc.reposByURL[key]
+	rc.mu.Unlock()
+	if ok {
 		return r
 	}
+
+	// Lazy resolve: call argoDB.GetRepository which applies repo-creds
+	// credential template prefix matching — the same enrichment the ArgoCD
+	// app controller uses in controller/state.go.
+	if rc.argoDB != nil {
+		repo, err := rc.argoDB.GetRepository(rc.ctx, repoURL, "")
+		if err != nil {
+			log.Warn().Err(err).Str("repoURL", repoURL).
+				Msg("⚠️ Failed lazy credential lookup for repo URL")
+		} else if repo.HasCredentials() {
+			rc.mu.Lock()
+			rc.reposByURL[key] = repo
+			rc.mu.Unlock()
+			log.Debug().Str("repoURL", repoURL).
+				Msg("🔑 Lazily resolved credentials for repo URL via credential templates")
+			return repo
+		}
+	}
+
 	// URL not found in the registry - return a bare stub.
 	// This is correct for public repositories that don't need credentials.
 	return &v1alpha1.Repository{Repo: repoURL}
