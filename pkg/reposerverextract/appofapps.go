@@ -251,6 +251,53 @@ func RenderApplicationsFromBothBranchesWithAppOfApps(
 		}
 	}()
 
+	// ── Lazy rendering optimisation for depth-0 seed apps ────────────────
+	// Seed apps (depth 0) exist on both branches. We render both sides first
+	// and compare the output. Only when the rendered manifests DIFFER do we
+	// enqueue child apps for traversal. This avoids rendering hundreds of
+	// unchanged child apps (e.g. when only one cluster's values changed).
+	//
+	// seedPending buffers depth-0 results by app Name. Once both base and
+	// target sides are collected, we compare and decide.
+	type seedPair struct {
+		base   *renderResult
+		target *renderResult
+	}
+	seedPending := make(map[string]*seedPair)
+	var skippedSeedChildren int32
+
+	// enqueueChildren is the shared logic for enqueuing child apps from a result.
+	enqueueChildren := func(r renderResult) {
+		if r.depth >= maxAppOfAppsDepth {
+			if len(r.childApps) > 0 {
+				log.Warn().Msgf("⚠️ App-of-apps depth limit (%d) reached; not enqueuing %d child(ren) of %s",
+					maxAppOfAppsDepth, len(r.childApps), r.extracted.Name)
+			}
+			return
+		}
+		childSelectionOptions := argoapplication.ApplicationSelectionOptions{
+			Selector:                   appSelectionOptions.Selector,
+			FilesChanged:               appSelectionOptions.FilesChanged,
+			IgnoreInvalidWatchPattern:  appSelectionOptions.IgnoreInvalidWatchPattern,
+			WatchIfNoWatchPatternFound: appSelectionOptions.WatchIfNoWatchPatternFound,
+		}
+		selection := argoapplication.ApplicationSelection(r.childApps, childSelectionOptions)
+		for _, skipped := range selection.SkippedApps {
+			log.Debug().Str("App", skipped.GetLongName()).Msg("Skipping child Application excluded by ApplicationSelectionOptions")
+		}
+		visitedMu.Lock()
+		for _, child := range selection.SelectedApps {
+			key := visitedKey(child.Yaml, child.Branch)
+			if visited[key] {
+				log.Debug().Str("App", child.GetLongName()).Msg("Skipping already-visited child Application")
+				continue
+			}
+			visited[key] = true
+			enqueue(child, r.depth+1)
+		}
+		visitedMu.Unlock()
+	}
+
 	// Single collector goroutine: reads results, collects extracted apps, and
 	// enqueues newly discovered children back onto the work channel.
 	//
@@ -281,42 +328,41 @@ func RenderApplicationsFromBothBranchesWithAppOfApps(
 					}
 				}
 
-				// Enqueue children that haven't been seen yet and pass the selection filter.
-				// Child apps are filtered by Selector, FilesChanged (via watch-pattern annotations),
-				// IgnoreInvalidWatchPattern, and WatchIfNoWatchPatternFound — exactly as top-level apps are.
-				// FilesChanged works correctly here: the PR diff is the same regardless of whether an
-				// app was discovered from a file or from a parent's rendered output; the watch pattern
-				// on the child app is what determines whether it is affected.
-				//
-				// FileRegex is intentionally excluded because it filters by the physical filename of
-				// the Application YAML file. Child apps don't come from a file; their FileName is
-				// "parent: <name>" (a breadcrumb), which would give false matches against any regex.
-				if r.depth < maxAppOfAppsDepth {
-					childSelectionOptions := argoapplication.ApplicationSelectionOptions{
-						Selector:                   appSelectionOptions.Selector,
-						FilesChanged:               appSelectionOptions.FilesChanged,
-						IgnoreInvalidWatchPattern:  appSelectionOptions.IgnoreInvalidWatchPattern,
-						WatchIfNoWatchPatternFound: appSelectionOptions.WatchIfNoWatchPatternFound,
-						// FileRegex intentionally omitted: child apps have no real file path
+				// For depth-0 (seed) apps, buffer until both branches are rendered,
+				// then compare. For deeper apps, enqueue children immediately.
+				if r.depth == 0 {
+					pair, ok := seedPending[r.extracted.Name]
+					if !ok {
+						pair = &seedPair{}
+						seedPending[r.extracted.Name] = pair
 					}
-					selection := argoapplication.ApplicationSelection(r.childApps, childSelectionOptions)
-					for _, skipped := range selection.SkippedApps {
-						log.Debug().Str("App", skipped.GetLongName()).Msg("Skipping child Application excluded by ApplicationSelectionOptions")
+					rCopy := r
+					if r.extracted.Branch == git.Base {
+						pair.base = &rCopy
+					} else {
+						pair.target = &rCopy
 					}
-					visitedMu.Lock()
-					for _, child := range selection.SelectedApps {
-						key := visitedKey(child.Yaml, child.Branch)
-						if visited[key] {
-							log.Debug().Str("App", child.GetLongName()).Msg("Skipping already-visited child Application")
-							continue
+
+					// Check if both sides are now available
+					if pair.base != nil && pair.target != nil {
+						baseContent, _ := pair.base.extracted.FlattenToString(nil)
+						targetContent, _ := pair.target.extracted.FlattenToString(nil)
+
+						if baseContent == targetContent {
+							log.Info().Str("App", r.extracted.Name).
+								Msgf("⏭️  Seed app output identical on both branches — skipping %d+%d child apps",
+									len(pair.base.childApps), len(pair.target.childApps))
+							skippedSeedChildren += int32(len(pair.base.childApps) + len(pair.target.childApps))
+						} else {
+							log.Info().Str("App", r.extracted.Name).
+								Msg("🔀 Seed app output differs between branches — traversing children")
+							enqueueChildren(*pair.base)
+							enqueueChildren(*pair.target)
 						}
-						visited[key] = true
-						enqueue(child, r.depth+1)
+						delete(seedPending, r.extracted.Name)
 					}
-					visitedMu.Unlock()
-				} else if len(r.childApps) > 0 {
-					log.Warn().Msgf("⚠️ App-of-apps depth limit (%d) reached; not enqueuing %d child(ren) of %s",
-						maxAppOfAppsDepth, len(r.childApps), r.extracted.Name)
+				} else {
+					enqueueChildren(r)
 				}
 			}
 
@@ -324,8 +370,25 @@ func RenderApplicationsFromBothBranchesWithAppOfApps(
 			// When all pending work is done, close the work channel so workers exit.
 			pending.Add(-1)
 			if pending.Load() == 0 {
-				close(work)
+				// Flush any unpaired seed results (app only on one branch = added/deleted).
+				for name, pair := range seedPending {
+					log.Debug().Str("App", name).Msg("Flushing unpaired seed app — present on only one branch")
+					if pair.base != nil {
+						enqueueChildren(*pair.base)
+					}
+					if pair.target != nil {
+						enqueueChildren(*pair.target)
+					}
+					delete(seedPending, name)
+				}
+				if pending.Load() == 0 {
+					close(work)
+				}
 			}
+		}
+
+		if skippedSeedChildren > 0 {
+			log.Info().Msgf("⏭️  Lazy rendering skipped %d child app renders from unchanged seed apps", skippedSeedChildren)
 		}
 	}()
 
