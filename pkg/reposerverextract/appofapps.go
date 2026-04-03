@@ -251,20 +251,22 @@ func RenderApplicationsFromBothBranchesWithAppOfApps(
 		}
 	}()
 
-	// ── Lazy rendering optimisation for depth-0 seed apps ────────────────
-	// Seed apps (depth 0) exist on both branches. We render both sides first
-	// and compare the output. Only when the rendered manifests DIFFER do we
-	// enqueue child apps for traversal. This avoids rendering hundreds of
-	// unchanged child apps (e.g. when only one cluster's values changed).
-	//
-	// seedPending buffers depth-0 results by app Name. Once both base and
-	// target sides are collected, we compare and decide.
-	type seedPair struct {
-		base   *renderResult
-		target *renderResult
+	// ── Lazy rendering: skip unchanged child apps ────────────────────────
+	// Child apps whose source repo is NOT the PR repo and whose spec is
+	// identical on both branches cannot have different rendered output.
+	// We buffer discovered children by name; once both branches are seen,
+	// we compare specs and skip rendering if they match.
+	// Children referencing the PR repo are always rendered because their
+	// values files may have changed even if the Application CRD is identical.
+	var skippedChildren atomic.Int32
+
+	// childBuffer stores one branch's child app keyed by name, waiting for
+	// its counterpart. Only used for depth-0 children (from seed apps).
+	type bufferedChild struct {
+		app   argoapplication.ArgoResource
+		depth int
 	}
-	seedPending := make(map[string]*seedPair)
-	var skippedSeedChildren int32
+	childBuffer := make(map[string]*bufferedChild) // key: child name
 
 	// enqueueChildren is the shared logic for enqueuing child apps from a result.
 	enqueueChildren := func(r renderResult) {
@@ -293,7 +295,44 @@ func RenderApplicationsFromBothBranchesWithAppOfApps(
 				continue
 			}
 			visited[key] = true
-			enqueue(child, r.depth+1)
+
+			// For depth-1 children (from seed apps), try to pair across
+			// branches and skip if spec is identical + source is external.
+			childDepth := r.depth + 1
+			if r.depth == 0 {
+				bufKey := child.Name
+				if prev, ok := childBuffer[bufKey]; ok {
+					// We have both branches — compare specs.
+					delete(childBuffer, bufKey)
+					prevHash := specHashOf(prev.app.Yaml)
+					curHash := specHashOf(child.Yaml)
+					sourceIsExternal := !repoURLContains(child.Yaml.GetAnnotations()["argocd-diff-preview/source-repo"], prRepo)
+					// Check source URL from the spec
+					sourceURL, _, _ := unstructured.NestedString(child.Yaml.Object, "spec", "source", "repoURL")
+					if sourceURL == "" {
+						sourceURL, _, _ = unstructured.NestedString(child.Yaml.Object, "spec", "sources", "0", "repoURL")
+					}
+					if sourceURL != "" {
+						sourceIsExternal = !repoURLContains(sourceURL, prRepo)
+					}
+
+					if prevHash == curHash && sourceIsExternal {
+						skippedChildren.Add(2)
+						log.Debug().Str("App", child.Name).
+							Msg("⏭️  Skipping child app — identical spec on both branches, external repo")
+						continue
+					}
+					// Specs differ or source is PR repo — render both
+					enqueue(prev.app, prev.depth)
+					enqueue(child, childDepth)
+					continue
+				}
+				// First branch seen — buffer and wait for counterpart
+				childBuffer[bufKey] = &bufferedChild{app: child, depth: childDepth}
+				continue
+			}
+
+			enqueue(child, childDepth)
 		}
 		visitedMu.Unlock()
 	}
@@ -328,58 +367,18 @@ func RenderApplicationsFromBothBranchesWithAppOfApps(
 					}
 				}
 
-				// For depth-0 (seed) apps, buffer until both branches are rendered,
-				// then compare. For deeper apps, enqueue children immediately.
-				if r.depth == 0 {
-					pair, ok := seedPending[r.extracted.Name]
-					if !ok {
-						pair = &seedPair{}
-						seedPending[r.extracted.Name] = pair
-					}
-					rCopy := r
-					if r.extracted.Branch == git.Base {
-						pair.base = &rCopy
-					} else {
-						pair.target = &rCopy
-					}
-
-					// Check if both sides are now available
-					if pair.base != nil && pair.target != nil {
-						baseContent, _ := pair.base.extracted.FlattenToString(nil)
-						targetContent, _ := pair.target.extracted.FlattenToString(nil)
-
-						if baseContent == targetContent {
-							log.Info().Str("App", r.extracted.Name).
-								Msgf("⏭️  Seed app output identical on both branches — skipping %d+%d child apps",
-									len(pair.base.childApps), len(pair.target.childApps))
-							skippedSeedChildren += int32(len(pair.base.childApps) + len(pair.target.childApps))
-						} else {
-							log.Info().Str("App", r.extracted.Name).
-								Msg("🔀 Seed app output differs between branches — traversing children")
-							enqueueChildren(*pair.base)
-							enqueueChildren(*pair.target)
-						}
-						delete(seedPending, r.extracted.Name)
-					}
-				} else {
-					enqueueChildren(r)
-				}
+				enqueueChildren(r)
 			}
 
 			// Decrement pending for both success and error paths.
-			// When all pending work is done, close the work channel so workers exit.
+			// When all pending work is done, flush buffered children and close work.
 			pending.Add(-1)
 			if pending.Load() == 0 {
-				// Flush any unpaired seed results (app only on one branch = added/deleted).
-				for name, pair := range seedPending {
-					log.Debug().Str("App", name).Msg("Flushing unpaired seed app — present on only one branch")
-					if pair.base != nil {
-						enqueueChildren(*pair.base)
-					}
-					if pair.target != nil {
-						enqueueChildren(*pair.target)
-					}
-					delete(seedPending, name)
+				// Flush any unpaired children (app only on one branch = added/deleted).
+				for name, buf := range childBuffer {
+					log.Debug().Str("App", name).Msg("Flushing unpaired child app — present on only one branch")
+					enqueue(buf.app, buf.depth)
+					delete(childBuffer, name)
 				}
 				if pending.Load() == 0 {
 					close(work)
@@ -387,8 +386,8 @@ func RenderApplicationsFromBothBranchesWithAppOfApps(
 			}
 		}
 
-		if skippedSeedChildren > 0 {
-			log.Info().Msgf("⏭️  Lazy rendering skipped %d child app renders from unchanged seed apps", skippedSeedChildren)
+		if s := skippedChildren.Load(); s > 0 {
+			log.Info().Msgf("⏭️  Lazy rendering skipped %d child app renders (identical spec, external repo)", s)
 		}
 	}()
 
