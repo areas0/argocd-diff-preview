@@ -341,7 +341,6 @@ func run(cfg *Config) error {
 				cfg.Repo,
 				appSelectionOptions,
 				tempFolder,
-				cfg.SkipIdenticalDedup,
 			)
 		} else {
 			baseManifests, targetManifests, extractDuration, err = reposerverextract.RenderApplicationsFromBothBranches(
