@@ -83,6 +83,7 @@ var (
 	DefaultOutputAppManifests         = false
 	DefaultOutputBranchManifests      = false
 	DefaultTraverseAppOfApps          = false
+	DefaultSkipIdenticalDedup         = false
 )
 
 // RawOptions holds the raw CLI/env inputs - used only for parsing
@@ -132,6 +133,7 @@ type RawOptions struct {
 	OutputAppManifests         bool   `mapstructure:"output-app-manifests"`
 	OutputBranchManifests      bool   `mapstructure:"output-branch-manifests"`
 	TraverseAppOfApps          bool   `mapstructure:"traverse-app-of-apps"`
+	SkipIdenticalDedup         bool   `mapstructure:"skip-identical-dedup"`
 }
 
 // Config is the final, validated, ready-to-use configuration
@@ -176,6 +178,7 @@ type Config struct {
 	OutputAppManifests         bool
 	OutputBranchManifests      bool
 	TraverseAppOfApps          bool
+	SkipIdenticalDedup         bool
 
 	// Parsed/processed fields - no "parsed" prefix needed
 	FileRegex           *regexp.Regexp
@@ -272,6 +275,7 @@ func Parse() *Config {
 	viper.SetDefault("output-app-manifests", DefaultOutputAppManifests)
 	viper.SetDefault("output-branch-manifests", DefaultOutputBranchManifests)
 	viper.SetDefault("traverse-app-of-apps", DefaultTraverseAppOfApps)
+	viper.SetDefault("skip-identical-dedup", DefaultSkipIdenticalDedup)
 
 	// Basic flags
 	rootCmd.Flags().BoolP("debug", "d", false, "Activate debug mode")
@@ -330,6 +334,7 @@ func Parse() *Config {
 	rootCmd.Flags().Bool("output-app-manifests", DefaultOutputAppManifests, "Write per-application manifest files to the output folder (output/base/ and output/target/)")
 	rootCmd.Flags().Bool("output-branch-manifests", DefaultOutputBranchManifests, "Write all application manifests per branch to a single file (output/base-branch.yaml and output/target-branch.yaml)")
 	rootCmd.Flags().Bool("traverse-app-of-apps", DefaultTraverseAppOfApps, "Recursively render child Applications discovered in rendered manifests (app-of-apps pattern). Only supported with --render-method=repo-server-api")
+	rootCmd.Flags().Bool("skip-identical-dedup", DefaultSkipIdenticalDedup, "Skip the Application/ApplicationSet YAML-equality dedup passes so traversal can reach children. Only meaningful with --traverse-app-of-apps. Typical use: resource-repo PRs where seed apps in the app repo are identical between branches but their downstream children differ.")
 
 	// Check if version flag was specified directly
 	for _, arg := range os.Args[1:] {
@@ -416,6 +421,7 @@ func (o *RawOptions) ToConfig() (*Config, error) {
 		OutputAppManifests:         o.OutputAppManifests,
 		OutputBranchManifests:      o.OutputBranchManifests,
 		TraverseAppOfApps:          o.TraverseAppOfApps,
+		SkipIdenticalDedup:         o.SkipIdenticalDedup,
 	}
 
 	var err error
@@ -749,5 +755,8 @@ func (o *Config) LogConfig() {
 	}
 	if o.TraverseAppOfApps {
 		log.Info().Msgf("✨ - traverse-app-of-apps: %t", o.TraverseAppOfApps)
+	}
+	if o.SkipIdenticalDedup {
+		log.Info().Msgf("✨ - skip-identical-dedup: %t", o.SkipIdenticalDedup)
 	}
 }

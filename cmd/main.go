@@ -106,7 +106,11 @@ func run(cfg *Config) error {
 		return err
 	}
 
-	baseApps, targetApps = duplicates.RemoveIdenticalCopiesBetweenBranches(baseApps, targetApps)
+	if cfg.SkipIdenticalDedup {
+		log.Info().Msg("⏭️  Skipping initial identical-Applications dedup (--skip-identical-dedup)")
+	} else {
+		baseApps, targetApps = duplicates.RemoveIdenticalCopiesBetweenBranches(baseApps, targetApps)
+	}
 
 	// If dry-run is enabled, show which applications would be processed and exit
 	if cfg.DryRun {
@@ -258,7 +262,11 @@ func run(cfg *Config) error {
 	}
 
 	// Check for duplicates again
-	baseApps, targetApps = duplicates.RemoveIdenticalCopiesBetweenBranches(baseApps, targetApps)
+	if cfg.SkipIdenticalDedup {
+		log.Info().Msg("⏭️  Skipping post-ApplicationSet identical-Applications dedup (--skip-identical-dedup)")
+	} else {
+		baseApps, targetApps = duplicates.RemoveIdenticalCopiesBetweenBranches(baseApps, targetApps)
+	}
 
 	// Return if no applications are found
 	foundBaseApps = len(baseApps.SelectedApps) > 0
