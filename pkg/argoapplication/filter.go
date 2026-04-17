@@ -25,6 +25,13 @@ type ApplicationSelectionOptions struct {
 	FilesChanged               []string
 	IgnoreInvalidWatchPattern  bool
 	WatchIfNoWatchPatternFound bool
+	// OnlyApps, when non-empty, is an allow-list of Application names. Any app whose
+	// name is not in the list is filtered out at selection time (same treatment for
+	// seeds and children). Names are matched against ArgoResource.Name (the
+	// Application's metadata.name). Typical use: a caller has pre-computed a
+	// dependency tree from a snapshot and wants the tool to render only the apps on
+	// paths that reach the PR repo, bypassing the lazy-skip heuristic.
+	OnlyApps []string
 }
 
 const maxFilesChangedDisplay = 20
@@ -102,6 +109,15 @@ func ApplicationSelection(
 func (a *ArgoResource) Filter(
 	appSelectionOptions ApplicationSelectionOptions,
 ) bool {
+
+	// --only-apps allow-list: reject first so non-whitelisted apps short-circuit
+	// with a clear reason. Whitelisted apps still flow through the ignore / selector /
+	// files-changed filters below — an explicitly-ignored app stays ignored even if
+	// the caller passed its name.
+	if len(appSelectionOptions.OnlyApps) > 0 && !slices.Contains(appSelectionOptions.OnlyApps, a.Name) {
+		log.Debug().Str(a.Kind.ShortName(), a.GetLongName()).Msgf("%s is not selected because: not in --only-apps allow-list", a.Kind.ShortName())
+		return false
+	}
 
 	// First check selected annotation
 	selected, reason := a.filterByIgnoreAnnotation()

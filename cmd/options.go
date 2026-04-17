@@ -84,6 +84,7 @@ var (
 	DefaultOutputBranchManifests      = false
 	DefaultTraverseAppOfApps          = false
 	DefaultSkipIdenticalDedup         = false
+	DefaultOnlyApps                   = ""
 )
 
 // RawOptions holds the raw CLI/env inputs - used only for parsing
@@ -134,6 +135,7 @@ type RawOptions struct {
 	OutputBranchManifests      bool   `mapstructure:"output-branch-manifests"`
 	TraverseAppOfApps          bool   `mapstructure:"traverse-app-of-apps"`
 	SkipIdenticalDedup         bool   `mapstructure:"skip-identical-dedup"`
+	OnlyApps                   string `mapstructure:"only-apps"`
 }
 
 // Config is the final, validated, ready-to-use configuration
@@ -179,6 +181,7 @@ type Config struct {
 	OutputBranchManifests      bool
 	TraverseAppOfApps          bool
 	SkipIdenticalDedup         bool
+	OnlyApps                   []string
 
 	// Parsed/processed fields - no "parsed" prefix needed
 	FileRegex           *regexp.Regexp
@@ -276,6 +279,7 @@ func Parse() *Config {
 	viper.SetDefault("output-branch-manifests", DefaultOutputBranchManifests)
 	viper.SetDefault("traverse-app-of-apps", DefaultTraverseAppOfApps)
 	viper.SetDefault("skip-identical-dedup", DefaultSkipIdenticalDedup)
+	viper.SetDefault("only-apps", DefaultOnlyApps)
 
 	// Basic flags
 	rootCmd.Flags().BoolP("debug", "d", false, "Activate debug mode")
@@ -335,6 +339,7 @@ func Parse() *Config {
 	rootCmd.Flags().Bool("output-branch-manifests", DefaultOutputBranchManifests, "Write all application manifests per branch to a single file (output/base-branch.yaml and output/target-branch.yaml)")
 	rootCmd.Flags().Bool("traverse-app-of-apps", DefaultTraverseAppOfApps, "Recursively render child Applications discovered in rendered manifests (app-of-apps pattern). Only supported with --render-method=repo-server-api")
 	rootCmd.Flags().Bool("skip-identical-dedup", DefaultSkipIdenticalDedup, "Skip the Application/ApplicationSet YAML-equality dedup passes so traversal can reach children. Only meaningful with --traverse-app-of-apps. Typical use: resource-repo PRs where seed apps in the app repo are identical between branches but their downstream children differ.")
+	rootCmd.Flags().String("only-apps", DefaultOnlyApps, "Comma/space/newline-separated allow-list of Application names. When set, only listed apps (and their descendants discovered via --traverse-app-of-apps) are rendered; other apps are filtered out at selection time. Empty/unset = no filtering. Typical use: caller has pre-computed a dependency tree that reaches the PR repo and passes it via this flag to avoid rendering unrelated apps.")
 
 	// Check if version flag was specified directly
 	for _, arg := range os.Args[1:] {
@@ -422,6 +427,7 @@ func (o *RawOptions) ToConfig() (*Config, error) {
 		OutputBranchManifests:      o.OutputBranchManifests,
 		TraverseAppOfApps:          o.TraverseAppOfApps,
 		SkipIdenticalDedup:         o.SkipIdenticalDedup,
+		OnlyApps:                   o.parseOnlyApps(),
 	}
 
 	var err error
@@ -509,6 +515,16 @@ func (o *RawOptions) parseFilesChanged() []string {
 		return nil
 	}
 	return strings.FieldsFunc(o.FilesChanged, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\n'
+	})
+}
+
+// parseOnlyApps parses the only-apps string into a slice of Application names.
+func (o *RawOptions) parseOnlyApps() []string {
+	if o.OnlyApps == "" {
+		return nil
+	}
+	return strings.FieldsFunc(o.OnlyApps, func(r rune) bool {
 		return r == ',' || r == ' ' || r == '\n'
 	})
 }
@@ -758,5 +774,8 @@ func (o *Config) LogConfig() {
 	}
 	if o.SkipIdenticalDedup {
 		log.Info().Msgf("✨ - skip-identical-dedup: %t", o.SkipIdenticalDedup)
+	}
+	if len(o.OnlyApps) > 0 {
+		log.Info().Msgf("✨ - only-apps: %s (%d entries)", strings.Join(o.OnlyApps, ","), len(o.OnlyApps))
 	}
 }
