@@ -91,6 +91,7 @@ func run(cfg *Config) error {
 		IgnoreInvalidWatchPattern:  cfg.IgnoreInvalidWatchPattern,
 		WatchIfNoWatchPatternFound: cfg.WatchIfNoWatchPatternFound,
 		OnlyApps:                   cfg.OnlyApps,
+		AppRepos:                   cfg.AppRepos,
 	}
 
 	// Get applications for both branches

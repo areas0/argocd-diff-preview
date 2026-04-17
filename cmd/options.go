@@ -18,6 +18,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/dag-andersen/argocd-diff-preview/pkg/app_selector"
+	"github.com/dag-andersen/argocd-diff-preview/pkg/argoapplication"
 	"github.com/dag-andersen/argocd-diff-preview/pkg/cluster"
 	"github.com/dag-andersen/argocd-diff-preview/pkg/k3d"
 	"github.com/dag-andersen/argocd-diff-preview/pkg/kind"
@@ -85,6 +86,7 @@ var (
 	DefaultTraverseAppOfApps          = false
 	DefaultSkipIdenticalDedup         = false
 	DefaultOnlyApps                   = ""
+	DefaultAppRepos                   = ""
 )
 
 // RawOptions holds the raw CLI/env inputs - used only for parsing
@@ -136,6 +138,7 @@ type RawOptions struct {
 	TraverseAppOfApps          bool   `mapstructure:"traverse-app-of-apps"`
 	SkipIdenticalDedup         bool   `mapstructure:"skip-identical-dedup"`
 	OnlyApps                   string `mapstructure:"only-apps"`
+	AppRepos                   string `mapstructure:"app-repos"`
 }
 
 // Config is the final, validated, ready-to-use configuration
@@ -182,6 +185,7 @@ type Config struct {
 	TraverseAppOfApps          bool
 	SkipIdenticalDedup         bool
 	OnlyApps                   []string
+	AppRepos                   []argoapplication.AppRepoEntry
 
 	// Parsed/processed fields - no "parsed" prefix needed
 	FileRegex           *regexp.Regexp
@@ -280,6 +284,7 @@ func Parse() *Config {
 	viper.SetDefault("traverse-app-of-apps", DefaultTraverseAppOfApps)
 	viper.SetDefault("skip-identical-dedup", DefaultSkipIdenticalDedup)
 	viper.SetDefault("only-apps", DefaultOnlyApps)
+	viper.SetDefault("app-repos", DefaultAppRepos)
 
 	// Basic flags
 	rootCmd.Flags().BoolP("debug", "d", false, "Activate debug mode")
@@ -340,6 +345,7 @@ func Parse() *Config {
 	rootCmd.Flags().Bool("traverse-app-of-apps", DefaultTraverseAppOfApps, "Recursively render child Applications discovered in rendered manifests (app-of-apps pattern). Only supported with --render-method=repo-server-api")
 	rootCmd.Flags().Bool("skip-identical-dedup", DefaultSkipIdenticalDedup, "Skip the Application/ApplicationSet YAML-equality dedup passes so traversal can reach children. Only meaningful with --traverse-app-of-apps. Typical use: resource-repo PRs where seed apps in the app repo are identical between branches but their downstream children differ.")
 	rootCmd.Flags().String("only-apps", DefaultOnlyApps, "Comma/space/newline-separated allow-list of Application names. When set, only listed apps (and their descendants discovered via --traverse-app-of-apps) are rendered; other apps are filtered out at selection time. Empty/unset = no filtering. Typical use: caller has pre-computed a dependency tree that reaches the PR repo and passes it via this flag to avoid rendering unrelated apps.")
+	rootCmd.Flags().String("app-repos", DefaultAppRepos, "Comma/space/newline-separated list of repo or repo:path entries marking intermediate (app-of-apps) chart sources. Apps whose source matches an entry bypass the depth-1 lazy-skip during --traverse-app-of-apps, so the chain stays alive even when their spec is identical and their source is external to --repo. Repo-only entries match any path in that repo; repo:path entries require exact path match (canonical: leading './' and surrounding '/' trimmed). Example: 'padoa/live-apps,padoa/padoa-helm-repo:medical-stack'.")
 
 	// Check if version flag was specified directly
 	for _, arg := range os.Args[1:] {
@@ -428,6 +434,7 @@ func (o *RawOptions) ToConfig() (*Config, error) {
 		TraverseAppOfApps:          o.TraverseAppOfApps,
 		SkipIdenticalDedup:         o.SkipIdenticalDedup,
 		OnlyApps:                   o.parseOnlyApps(),
+		AppRepos:                   o.parseAppRepos(),
 	}
 
 	var err error
@@ -527,6 +534,30 @@ func (o *RawOptions) parseOnlyApps() []string {
 	return strings.FieldsFunc(o.OnlyApps, func(r rune) bool {
 		return r == ',' || r == ' ' || r == '\n'
 	})
+}
+
+// parseAppRepos parses the app-repos string into a slice of AppRepoEntry.
+// Each entry is either "repo" (any path) or "repo:path" (exact path match).
+// Path is canonicalised: leading "./" stripped and leading/trailing "/" trimmed.
+func (o *RawOptions) parseAppRepos() []argoapplication.AppRepoEntry {
+	if o.AppRepos == "" {
+		return nil
+	}
+	parts := strings.FieldsFunc(o.AppRepos, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\n'
+	})
+	entries := make([]argoapplication.AppRepoEntry, 0, len(parts))
+	for _, p := range parts {
+		if p == "" {
+			continue
+		}
+		repo, path, _ := strings.Cut(p, ":")
+		entries = append(entries, argoapplication.AppRepoEntry{
+			Repo: strings.TrimSpace(repo),
+			Path: argoapplication.CanonicalPath(path),
+		})
+	}
+	return entries
 }
 
 // parseFileRegex returns a compiled regex if set
@@ -777,5 +808,12 @@ func (o *Config) LogConfig() {
 	}
 	if len(o.OnlyApps) > 0 {
 		log.Info().Msgf("✨ - only-apps: %s (%d entries)", strings.Join(o.OnlyApps, ","), len(o.OnlyApps))
+	}
+	if len(o.AppRepos) > 0 {
+		strs := make([]string, len(o.AppRepos))
+		for i, e := range o.AppRepos {
+			strs[i] = e.String()
+		}
+		log.Info().Msgf("✨ - app-repos: %s (%d entries)", strings.Join(strs, ","), len(o.AppRepos))
 	}
 }
