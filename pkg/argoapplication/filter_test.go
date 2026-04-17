@@ -992,6 +992,105 @@ metadata:
 	}
 }
 
+func TestFilterByOnlyApps(t *testing.T) {
+
+	zerolog.SetGlobalLevel(zerolog.FatalLevel)
+
+	baseYaml := `
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: foo
+  labels:
+    app: test`
+
+	tests := []struct {
+		name      string
+		appName   string
+		yaml      string
+		onlyApps  []string
+		selectors []app_selector.Selector
+		want      bool
+	}{
+		{
+			name:     "nil OnlyApps is a pass-through (backward compat)",
+			appName:  "foo",
+			yaml:     baseYaml,
+			onlyApps: nil,
+			want:     true,
+		},
+		{
+			name:     "empty OnlyApps is a pass-through (backward compat)",
+			appName:  "foo",
+			yaml:     baseYaml,
+			onlyApps: []string{},
+			want:     true,
+		},
+		{
+			name:     "name present in OnlyApps is accepted",
+			appName:  "foo",
+			yaml:     baseYaml,
+			onlyApps: []string{"foo", "bar"},
+			want:     true,
+		},
+		{
+			name:     "name absent from OnlyApps is rejected",
+			appName:  "foo",
+			yaml:     baseYaml,
+			onlyApps: []string{"bar", "baz"},
+			want:     false,
+		},
+		{
+			name:    "whitelisted app still fails other filters — selectors",
+			appName: "foo",
+			yaml:    baseYaml,
+			selectors: []app_selector.Selector{
+				{Key: "app", Value: "other", Operator: app_selector.Eq},
+			},
+			onlyApps: []string{"foo"},
+			want:     false,
+		},
+		{
+			name:    "whitelisted app still honours ignore annotation",
+			appName: "foo",
+			yaml: `
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: foo
+  labels:
+    app: test
+  annotations:
+    argocd-diff-preview/ignore: "true"`,
+			onlyApps: []string{"foo"},
+			want:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var node unstructured.Unstructured
+			err := yaml.Unmarshal([]byte(tt.yaml), &node)
+			assert.NoError(t, err)
+
+			app := &ArgoResource{
+				Yaml:     &node,
+				Kind:     Application,
+				Id:       tt.appName,
+				Name:     tt.appName,
+				FileName: "test.yaml",
+			}
+
+			got := app.Filter(ApplicationSelectionOptions{
+				OnlyApps:  tt.onlyApps,
+				Selector:  tt.selectors,
+			})
+
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestFilterByAnnotationWatchPattern(t *testing.T) {
 
 	zerolog.SetGlobalLevel(zerolog.FatalLevel)
