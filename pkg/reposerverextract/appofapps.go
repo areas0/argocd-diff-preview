@@ -136,7 +136,13 @@ func RenderApplicationsFromBothBranchesWithAppOfApps(
 	prRepo string,
 	appSelectionOptions argoapplication.ApplicationSelectionOptions,
 	tempFolder string,
+	// contentRepo is the owner/repo whose content is mounted at /base-branch
+	// and /target-branch. Empty = fall back to prRepo (same-repo mode).
+	contentRepo string,
 ) ([]extract.ExtractedApp, []extract.ExtractedApp, time.Duration, error) {
+	if contentRepo == "" {
+		contentRepo = prRepo
+	}
 	startTime := time.Now()
 
 	branchFolderByType := map[git.BranchType]string{
@@ -419,7 +425,7 @@ func RenderApplicationsFromBothBranchesWithAppOfApps(
 			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(remainingTime())*time.Second)
 			defer cancel()
 
-			manifests, childApps, err := renderAppWithChildDiscovery(ctx, repoClient, argocd, item.app, branchFolderByType, branchByType, namespacedScopedResources, creds, prRepo, argocd.Namespace, tempFolder, item.depth)
+			manifests, childApps, err := renderAppWithChildDiscovery(ctx, repoClient, argocd, item.app, branchFolderByType, branchByType, namespacedScopedResources, creds, prRepo, contentRepo, argocd.Namespace, tempFolder, item.depth)
 			if err != nil {
 				results <- renderResult{err: fmt.Errorf("failed to render app %s: %w", item.app.GetLongName(), err)}
 				return
@@ -481,11 +487,12 @@ func renderAppWithChildDiscovery(
 	namespacedScopedResources map[schema.GroupKind]bool,
 	creds *RepoCreds,
 	prRepo string,
+	contentRepo string,
 	argocdNamespace string,
 	tempFolder string,
 	depth int,
 ) ([]unstructured.Unstructured, []argoapplication.ArgoResource, error) {
-	allManifests, err := renderApp(ctx, repoClient, app, branchFolderByType, namespacedScopedResources, creds, prRepo)
+	allManifests, err := renderApp(ctx, repoClient, app, branchFolderByType, namespacedScopedResources, creds, prRepo, contentRepo)
 	if err != nil {
 		return nil, nil, err
 	}
