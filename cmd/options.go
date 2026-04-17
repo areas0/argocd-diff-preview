@@ -87,6 +87,7 @@ var (
 	DefaultSkipIdenticalDedup         = false
 	DefaultOnlyApps                   = ""
 	DefaultAppRepos                   = ""
+	DefaultContentRepo                = ""
 )
 
 // RawOptions holds the raw CLI/env inputs - used only for parsing
@@ -139,6 +140,7 @@ type RawOptions struct {
 	SkipIdenticalDedup         bool   `mapstructure:"skip-identical-dedup"`
 	OnlyApps                   string `mapstructure:"only-apps"`
 	AppRepos                   string `mapstructure:"app-repos"`
+	ContentRepo                string `mapstructure:"content-repo"`
 }
 
 // Config is the final, validated, ready-to-use configuration
@@ -186,6 +188,7 @@ type Config struct {
 	SkipIdenticalDedup         bool
 	OnlyApps                   []string
 	AppRepos                   []argoapplication.AppRepoEntry
+	ContentRepo                string
 
 	// Parsed/processed fields - no "parsed" prefix needed
 	FileRegex           *regexp.Regexp
@@ -285,6 +288,7 @@ func Parse() *Config {
 	viper.SetDefault("skip-identical-dedup", DefaultSkipIdenticalDedup)
 	viper.SetDefault("only-apps", DefaultOnlyApps)
 	viper.SetDefault("app-repos", DefaultAppRepos)
+	viper.SetDefault("content-repo", DefaultContentRepo)
 
 	// Basic flags
 	rootCmd.Flags().BoolP("debug", "d", false, "Activate debug mode")
@@ -346,6 +350,7 @@ func Parse() *Config {
 	rootCmd.Flags().Bool("skip-identical-dedup", DefaultSkipIdenticalDedup, "Skip the Application/ApplicationSet YAML-equality dedup passes so traversal can reach children. Only meaningful with --traverse-app-of-apps. Typical use: resource-repo PRs where seed apps in the app repo are identical between branches but their downstream children differ.")
 	rootCmd.Flags().String("only-apps", DefaultOnlyApps, "Comma/space/newline-separated allow-list of Application names. When set, only listed apps (and their descendants discovered via --traverse-app-of-apps) are rendered; other apps are filtered out at selection time. Empty/unset = no filtering. Typical use: caller has pre-computed a dependency tree that reaches the PR repo and passes it via this flag to avoid rendering unrelated apps.")
 	rootCmd.Flags().String("app-repos", DefaultAppRepos, "Comma/space/newline-separated list of repo or repo:path entries marking intermediate (app-of-apps) chart sources. Apps whose source matches an entry bypass the depth-1 lazy-skip during --traverse-app-of-apps, so the chain stays alive even when their spec is identical and their source is external to --repo. Repo-only entries match any path in that repo; repo:path entries require exact path match (canonical: leading './' and surrounding '/' trimmed). Example: 'padoa/live-apps,padoa/padoa-helm-repo:medical-stack'.")
+	rootCmd.Flags().String("content-repo", DefaultContentRepo, "owner/repo of the repository whose content is mounted at /base-branch and /target-branch. Defaults to --repo (same-repo mode). Set this to the 'app repo' when rendering a resource-repo PR where the Application manifests live in a different repo than the PR itself (multi-repo mode). Controls the stream-vs-remote-RPC decision during traversal: apps whose source matches --content-repo are streamed from the local mount; others go through a remote clone. Without this flag in cross-repo mode, children sourced from --repo are misinterpreted as 'local' and fail with 'app path does not exist' because /target-branch holds different files.")
 
 	// Check if version flag was specified directly
 	for _, arg := range os.Args[1:] {
@@ -435,6 +440,7 @@ func (o *RawOptions) ToConfig() (*Config, error) {
 		SkipIdenticalDedup:         o.SkipIdenticalDedup,
 		OnlyApps:                   o.parseOnlyApps(),
 		AppRepos:                   o.parseAppRepos(),
+		ContentRepo:                strings.TrimSpace(o.ContentRepo),
 	}
 
 	var err error
@@ -815,5 +821,8 @@ func (o *Config) LogConfig() {
 			strs[i] = e.String()
 		}
 		log.Info().Msgf("✨ - app-repos: %s (%d entries)", strings.Join(strs, ","), len(o.AppRepos))
+	}
+	if o.ContentRepo != "" {
+		log.Info().Msgf("✨ - content-repo: %s", o.ContentRepo)
 	}
 }

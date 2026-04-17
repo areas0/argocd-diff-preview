@@ -72,6 +72,11 @@ func RenderApplicationsFromBothBranches(
 	baseApps []argoapplication.ArgoResource,
 	targetApps []argoapplication.ArgoResource,
 	prRepo string,
+	// contentRepo is the owner/repo whose content is mounted at /base-branch
+	// and /target-branch. In same-repo mode this equals prRepo; in cross-repo
+	// mode (e.g. PR on padoa-helm-repo with app manifests in live-apps)
+	// callers pass the app repo. Empty = fall back to prRepo.
+	contentRepo string,
 ) ([]extract.ExtractedApp, []extract.ExtractedApp, time.Duration, error) {
 	startTime := time.Now()
 
@@ -175,7 +180,7 @@ func RenderApplicationsFromBothBranches(
 			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(remainingTime())*time.Second)
 			defer cancel()
 
-			manifests, err := renderApp(ctx, repoClient, app, branchFolderByType, namespacedScopedResources, creds, prRepo)
+			manifests, err := renderApp(ctx, repoClient, app, branchFolderByType, namespacedScopedResources, creds, prRepo, contentRepo)
 			if err != nil {
 				results <- result{err: fmt.Errorf("failed to render app %s: %w", app.GetLongName(), err)}
 				return
@@ -250,7 +255,13 @@ func renderApp(
 	namespacedScopedResources map[schema.GroupKind]bool,
 	creds *RepoCreds,
 	prRepo string,
+	contentRepo string,
 ) ([]unstructured.Unstructured, error) {
+	// Fall back to prRepo if the caller didn't specify a content-repo.
+	// Preserves same-repo-mode callers that haven't been updated.
+	if contentRepo == "" {
+		contentRepo = prRepo
+	}
 	branchFolder, ok := branchFolderByType[app.Branch]
 	if !ok {
 		return nil, fmt.Errorf("unknown branch type: %s", app.Branch)
@@ -264,7 +275,7 @@ func renderApp(
 	var allManifestStrings []string
 
 	for i, contentSource := range contentSources {
-		request, streamDir, cleanup, err := buildManifestRequestForSource(app, contentSource, refSources, hasMultipleSources, branchFolder, creds, prRepo)
+		request, streamDir, cleanup, err := buildManifestRequestForSource(app, contentSource, refSources, hasMultipleSources, branchFolder, creds, contentRepo)
 		if err != nil {
 			return nil, fmt.Errorf("failed to build manifest request for content source %d: %w", i, err)
 		}
@@ -485,10 +496,12 @@ func splitSources(app argoapplication.ArgoResource) (
 // in the ManifestRequest are rewritten to relative paths, following the same
 // approach used by other tools that integrate with the repo server.
 //
-// prRepo is the URL of the pull-request repository. When the primary source's
-// repoURL does not match prRepo the source files are not present locally;
-// in that case the function returns streamDir="" so the caller uses the remote
-// GenerateManifest RPC and the repo server fetches the content itself.
+// contentRepo is the owner/repo of the files in branchFolder. Sources whose
+// repoURL does not match contentRepo are not present locally; the function
+// returns streamDir="" so the caller uses the remote GenerateManifest RPC and
+// the repo server fetches the content itself. In same-repo mode contentRepo
+// equals the PR repo (--repo). In cross-repo mode callers set --content-repo
+// to the app repo whose files are mounted.
 //
 // cleanup must be called by the caller when the stream directory is no longer
 // needed.
@@ -499,7 +512,7 @@ func buildManifestRequestForSource(
 	hasMultipleSources bool,
 	branchFolder string,
 	creds *RepoCreds,
-	prRepo string,
+	contentRepo string,
 ) (request *repoapiclient.ManifestRequest, streamDir string, cleanup func(), err error) {
 	obj := app.Yaml.Object
 
@@ -543,11 +556,11 @@ func buildManifestRequestForSource(
 		// repository than the PR repo. Those files are not checked out
 		// locally, so we cannot stream them. Fall back to the remote
 		// GenerateManifest RPC and let the repo server fetch them itself.
-		if prRepo != "" && !repoURLContains(primarySource.RepoURL, prRepo) {
+		if contentRepo != "" && !repoURLContains(primarySource.RepoURL, contentRepo) {
 			log.Debug().
 				Str("App", app.GetLongName()).
 				Str("sourceRepoURL", primarySource.RepoURL).
-				Str("prRepo", prRepo).
+				Str("contentRepo", contentRepo).
 				Msg("Source repoURL does not match PR repo - using remote RPC")
 			request = &repoapiclient.ManifestRequest{
 				Repo:               creds.GetRepo(primarySource.RepoURL),
@@ -615,12 +628,12 @@ func buildManifestRequestForSource(
 	// cannot stream its files locally. Use the remote RPC and let the repo
 	// server fetch both the primary content and the ref sources from their
 	// respective git caches. Value-file $ref/… paths are left unrewritten.
-	if prRepo != "" && !repoURLContains(primarySource.RepoURL, prRepo) {
+	if contentRepo != "" && !repoURLContains(primarySource.RepoURL, contentRepo) {
 		log.Debug().
 			Str("App", app.GetLongName()).
 			Str("sourceRepoURL", primarySource.RepoURL).
-			Str("prRepo", prRepo).
-			Msg("Source repoURL does not match PR repo (slow path) - using remote RPC")
+			Str("contentRepo", contentRepo).
+			Msg("Source repoURL does not match content repo (slow path) - using remote RPC")
 		refSourcesMap := make(map[string]*v1alpha1.RefTarget, len(refSources))
 		for _, ref := range refSources {
 			refSourcesMap["$"+ref.Ref] = &v1alpha1.RefTarget{
