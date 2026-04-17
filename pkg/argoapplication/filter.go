@@ -32,6 +32,12 @@ type ApplicationSelectionOptions struct {
 	// dependency tree from a snapshot and wants the tool to render only the apps on
 	// paths that reach the PR repo, bypassing the lazy-skip heuristic.
 	OnlyApps []string
+	// AppRepos marks intermediate (app-of-apps) chart sources. Apps whose
+	// spec.source matches an entry bypass the depth-1 lazy-skip during
+	// --traverse-app-of-apps so the chain stays alive through them. Does NOT
+	// affect ApplicationSelection — only the skip logic in
+	// reposerverextract/appofapps.go consults this field.
+	AppRepos []AppRepoEntry
 }
 
 const maxFilesChangedDisplay = 20

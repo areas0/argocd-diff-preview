@@ -136,13 +136,6 @@ func RenderApplicationsFromBothBranchesWithAppOfApps(
 	prRepo string,
 	appSelectionOptions argoapplication.ApplicationSelectionOptions,
 	tempFolder string,
-	// skipLazyIdentical disables the pre-render "identical spec + external source"
-	// pair-check that would otherwise prune depth-1 children of seed apps. The check
-	// is correct for flat 2-layer trees but wrong for multi-layer graphs where an
-	// external-sourced intermediate (e.g. an App pointing to the app-repo) has
-	// children whose sources DO reference the PR repo. Passed through from
-	// cfg.SkipIdenticalDedup so the resource-repo-PR flow opts in wholesale.
-	skipLazyIdentical bool,
 ) ([]extract.ExtractedApp, []extract.ExtractedApp, time.Duration, error) {
 	startTime := time.Now()
 
@@ -323,13 +316,24 @@ func RenderApplicationsFromBothBranchesWithAppOfApps(
 						sourceIsExternal = !repoURLContains(sourceURL, prRepo)
 					}
 
-					if prevHash == curHash && sourceIsExternal && !skipLazyIdentical {
+					// --app-repos bypass: if the child's source is an intermediate chart
+					// the caller pre-declared, always render — even when the spec looks
+					// identical. This keeps multi-layer chains (e.g. live-apps →
+					// medical-envs → medical-stack) alive when the top-level App's own
+					// spec is identical but its rendered children DO reference the PR repo.
+					sourceInAppRepos := argoapplication.SourceMatchesAppRepos(child.Yaml, appSelectionOptions.AppRepos)
+
+					if prevHash == curHash && sourceIsExternal && !sourceInAppRepos {
 						skippedChildren.Add(2)
 						log.Debug().Str("App", child.Name).
 							Msg("⏭️  Skipping child app — identical spec on both branches, external repo")
 						continue
 					}
-					// Specs differ or source is PR repo — render both
+					if sourceInAppRepos {
+						log.Debug().Str("App", child.Name).
+							Msg("🔗 Force-rendering child — source matches --app-repos (chain intermediate)")
+					}
+					// Specs differ, source is PR repo, or source matches --app-repos — render both
 					enqueue(prev.app, prev.depth)
 					enqueue(child, childDepth)
 					continue
